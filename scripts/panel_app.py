@@ -197,7 +197,7 @@ class Panel:
         if source is None:
             return
         self._set_busy(True)
-        self.md_recon.content = "reconstructing ..."
+        self.md_recon.content = "**reconstructing ...** (takes ~10-20 s)"
         try:
             name = shim.sanitize(source.stem if source.is_file()
                                  else source.name)
@@ -242,8 +242,11 @@ class Panel:
 
     def _load_reference(self):
         info = json.loads((self.task_dir / "task_info.json").read_text())
-        self.ref_qpos = np.load(
+        ref_qpos = np.load(
             self.task_dir / "0/trajectory_kinematic.npz")["qpos"]
+        # unpublish first: tick() runs concurrently in the main thread and
+        # must not touch handles while they are being rebuilt
+        self.ref_qpos = None
         self.res_qpos = None
         for h in self.scene_handles + self.hand_handles:
             h.remove()
@@ -281,10 +284,12 @@ class Panel:
         box_mesh = trimesh.creation.box(info["box_size"])
         self.ref_box = add("/ref_box", box_mesh.vertices, box_mesh.faces,
                            color=(200, 60, 60), opacity=0.4,
-                           position=self.ref_qpos[0, 36:39],
-                           wxyz=self.ref_qpos[0, 39:43])
+                           position=ref_qpos[0, 36:39],
+                           wxyz=ref_qpos[0, 39:43])
         self._box_mesh = box_mesh
         self.ref_base.visible = True
+        self.gui_frame.value = 0.0
+        self.ref_qpos = ref_qpos  # publish LAST: handles are complete now
 
     # ----------------------------------------------------------- solve --
     def do_solve(self):
@@ -335,7 +340,7 @@ class Panel:
             self._set_busy(False)
 
     def _load_result(self):
-        self.res_qpos = np.load(
+        res_qpos = np.load(
             self.task_dir / "0/trajectory_mjwp.npz")["qpos"].reshape(-1, 43)
         if self.res_base is None:
             self.res_base, self.res_vis, _ = self._add_robot("res_robot")
@@ -344,19 +349,20 @@ class Panel:
             self.res_box.remove()
         self.res_box = self.server.scene.add_mesh_simple(
             "/res_box", self._box_mesh.vertices, self._box_mesh.faces,
-            color=(60, 180, 60), position=self.res_qpos[0, 36:39],
-            wxyz=self.res_qpos[0, 39:43])
+            color=(60, 180, 60), position=res_qpos[0, 36:39],
+            wxyz=res_qpos[0, 39:43])
         for h in self.hand_handles:
             h.remove()
-        self.hand_handles = []
-        hand_meshes, self.hand_poses = hand_collision_geoms(
-            self.task_dir / "scene.xml", self.res_qpos)
+        hand_handles = []
+        hand_meshes, hand_poses = hand_collision_geoms(
+            self.task_dir / "scene.xml", res_qpos)
         for k, side in enumerate(("lh", "rh")):
-            self.hand_handles.append(self.server.scene.add_mesh_simple(
+            hand_handles.append(self.server.scene.add_mesh_simple(
                 f"/hand_{side}", hand_meshes[k].vertices, hand_meshes[k].faces,
                 color=(230, 180, 40), opacity=0.6,
-                position=self.hand_poses[0, k, :3],
-                wxyz=self.hand_poses[0, k, 3:]))
+                position=hand_poses[0, k, :3], wxyz=hand_poses[0, k, 3:]))
+        self.hand_handles, self.hand_poses = hand_handles, hand_poses
+        self.res_qpos = res_qpos  # publish LAST: handles are complete now
 
     def _eval(self, task):
         out = subprocess.run(
@@ -370,30 +376,33 @@ class Panel:
 
     # -------------------------------------------------------- playback --
     def tick(self):
-        if self.ref_qpos is None:
+        # snapshot: worker threads swap these while we run
+        q, ref_box = self.ref_qpos, self.ref_box
+        if q is None or ref_box is None:
             return
-        T = len(self.ref_qpos)
+        T = len(q)
         if self.gui_play.value:
             self.gui_frame.value = (self.gui_frame.value
                                     + 1.0 / max(T - 1, 1)) % 1.0
         t = min(int(self.gui_frame.value * (T - 1)), T - 1)
-        q = self.ref_qpos
         self.ref_base.position = q[t, :3]
         self.ref_base.wxyz = q[t, 3:7]
         self.ref_vis.update_cfg(q[t, 7:36][self.order])
-        self.ref_box.position = q[t, 36:39]
-        self.ref_box.wxyz = q[t, 39:43]
-        if self.res_qpos is not None:
-            s = min(t * 2, len(self.res_qpos) - 1)  # result 60 Hz vs ref 30
-            r = self.res_qpos
+        ref_box.position = q[t, 36:39]
+        ref_box.wxyz = q[t, 39:43]
+        r, res_box = self.res_qpos, self.res_box
+        hand_poses, hand_handles = self.hand_poses, self.hand_handles
+        if r is not None and self.res_base is not None and res_box is not None:
+            s = min(t * 2, len(r) - 1)  # result 60 Hz vs ref 30
             self.res_base.position = r[s, :3]
             self.res_base.wxyz = r[s, 3:7]
             self.res_vis.update_cfg(r[s, 7:36][self.order])
-            self.res_box.position = r[s, 36:39]
-            self.res_box.wxyz = r[s, 39:43]
-            for k, h in enumerate(self.hand_handles):
-                h.position = self.hand_poses[s, k, :3]
-                h.wxyz = self.hand_poses[s, k, 3:]
+            res_box.position = r[s, 36:39]
+            res_box.wxyz = r[s, 39:43]
+            if hand_poses is not None and len(hand_poses) == len(r):
+                for k, h in enumerate(hand_handles):
+                    h.position = hand_poses[s, k, :3]
+                    h.wxyz = hand_poses[s, k, 3:]
 
 
 def main():
@@ -403,8 +412,12 @@ def main():
     server = viser.ViserServer(port=args.port)
     panel = Panel(server)
     print(f"panel at http://localhost:{args.port}", flush=True)
+    import traceback
     while True:
-        panel.tick()
+        try:
+            panel.tick()
+        except Exception:  # a transient race must never kill the server
+            traceback.print_exc()
         time.sleep(1.0 / (30.0 * panel.gui_speed.value))
 
 
