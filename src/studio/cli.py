@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -58,30 +59,74 @@ def cmd_tunnel(cfg: Config, args) -> int:
     os.execvp("ssh", cmd)
 
 
-def cmd_demo(cfg: Config, args) -> int:
-    url = f"http://127.0.0.1:{cfg.encoder_port}/"
+def _encoder_up(url: str) -> bool:
     try:
         urllib.request.urlopen(url, timeout=5)
+        return True
     except urllib.error.HTTPError:
-        pass  # any HTTP response means the tunnel is up
+        return True  # any HTTP response means something is serving
     except OSError:
-        print(f"text encoder not reachable at {url}\n"
-              "Bring it up first:\n"
-              f"  1. on {cfg.encoder_host}:  sbatch remote/encoder_euler.sh"
-              "   (job log prints the node)\n"
-              "  2. here:            studio tunnel <node>\n"
-              "then re-run: studio demo", file=sys.stderr)
-        return 1
+        return False
+
+
+def cmd_demo(cfg: Config, args) -> int:
+    url = f"http://127.0.0.1:{cfg.encoder_port}/"
     demo_bin = cfg.kimodo_python.parent / "kimodo_demo"
     if not demo_bin.exists():
         print("kimodo venv missing — run `studio setup` first", file=sys.stderr)
         return 1
     env = dict(os.environ, TEXT_ENCODER_MODE="api", TEXT_ENCODER_URL=url,
                SERVER_PORT=str(cfg.demo_port))
+    server = None
+
+    if args.offline:
+        if _encoder_up(url):
+            print(f"port {cfg.encoder_port} is already serving — the tunnel "
+                  "is up, run plain `studio demo` instead", file=sys.stderr)
+            return 1
+        emb_dir = REPO_ROOT / "offline_cache/embeddings"
+        snapshots = sorted((REPO_ROOT / "offline_cache/snapshots").glob("*.npz"))
+        server = subprocess.Popen(
+            [str(cfg.kimodo_python), str(REPO_ROOT / "scripts/offline_encoder.py"),
+             "--cache-dir", str(emb_dir), "--model", cfg.model_short,
+             "--port", str(cfg.encoder_port),
+             *(a for s in snapshots for a in ("--seed", str(s)))])
+        for _ in range(60):
+            if _encoder_up(url):
+                break
+            if server.poll() is not None:
+                print("offline encoder server died at startup", file=sys.stderr)
+                return 1
+            time.sleep(1)
+        else:
+            server.terminate()
+            print("offline encoder server did not come up", file=sys.stderr)
+            return 1
+        # isolated cache: offline zero-embeddings must never pollute the
+        # real demo cache used by tunnel sessions
+        env["kimodo_EMBED_CACHE_DIR"] = str(emb_dir)
+        print(f"offline mode: known prompts from {len(snapshots)} snapshot(s) "
+              "+ demo cache; NEW prompts will be IGNORED by generation "
+              "(watch the server warnings)", flush=True)
+    elif not _encoder_up(url):
+        print(f"text encoder not reachable at {url}\n"
+              "Bring it up first:\n"
+              f"  1. on {cfg.encoder_host}:  sbatch remote/encoder_euler.sh"
+              "   (job log prints the node)\n"
+              "  2. here:            studio tunnel <node>\n"
+              "then re-run: studio demo  (or use `studio demo --offline` "
+              "for already-encoded prompts)", file=sys.stderr)
+        return 1
+
     print(f"demo: http://127.0.0.1:{cfg.demo_port}\n"
           f"Save Example dir (watched by `studio watch`): {cfg.examples_dir}",
           flush=True)
-    os.execve(str(demo_bin), [str(demo_bin), "--model", cfg.model], env)
+    try:
+        return subprocess.run(
+            [str(demo_bin), "--model", cfg.model], env=env).returncode
+    finally:
+        if server is not None:
+            server.terminate()
 
 
 def _resolve_example(cfg: Config, spec: str) -> Path | None:
@@ -184,8 +229,11 @@ def main() -> None:
                    help="compute node (jumps via the login host); omit to "
                         "tunnel to the login host itself")
     p.set_defaults(func=cmd_tunnel)
-    sub.add_parser("demo", help="launch the Kimodo viser demo").set_defaults(
-        func=cmd_demo)
+    p = sub.add_parser("demo", help="launch the Kimodo viser demo")
+    p.add_argument("--offline", action="store_true",
+                   help="no cluster: serve embeddings from snapshots + demo "
+                        "cache; new prompts generate unconditioned motion")
+    p.set_defaults(func=cmd_demo)
     sub.add_parser("watch", help="auto-process new Save Example dirs"
                    ).set_defaults(func=cmd_watch)
     p = sub.add_parser("run", help="process one Save Example dir")

@@ -28,13 +28,17 @@ class Config:
         return self.mppi_locoma / ".venv/bin/python"
 
     @property
+    def model_short(self) -> str:
+        # Registry short key: display name lowercased minus the version
+        # suffix, e.g. Kimodo-G1-RP-v1 -> kimodo-g1-rp. Also the demo's
+        # embedding-cache namespace.
+        return self.model.lower().removesuffix("-v1")
+
+    @property
     def examples_dir(self) -> Path:
         # The demo's hardcoded Save Example base: <pkg>/assets/demo/examples/
-        # <short_key> (kimodo/assets.py + kimodo/demo/config.py). The short
-        # key is the display name lowercased minus the version suffix,
-        # e.g. Kimodo-G1-RP-v1 -> kimodo-g1-rp.
-        short = self.model.lower().removesuffix("-v1")
-        return self.kimodo_repo / "kimodo/assets/demo/examples" / short
+        # <short_key> (kimodo/assets.py + kimodo/demo/config.py).
+        return self.kimodo_repo / "kimodo/assets/demo/examples" / self.model_short
 
 
 def load_config() -> Config:

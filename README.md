@@ -73,9 +73,18 @@ central outputs, which is exactly why studio runs are kept isolated.
   prompt embeddings (`~/.cache/kimodo_demo/embeddings`), but kimodo's
   `batch_generate.py` fetches them transiently. While a tunnel is up, run
   `.venv-kimodo/bin/python scripts/encode_via_api.py --batch_dir <dir>` once —
-  it writes `text_embeddings.npz` (auto-detected by `batch_generate.py`), and
-  that prompt never needs the cluster again, for any seed/duration/sample
-  count.
+  it writes `text_embeddings.npz` (auto-detected by `batch_generate.py`) and
+  drops a copy into `offline_cache/snapshots/`. That prompt then never needs
+  the cluster again — for any seed, duration, sample count, or constraints.
+- **`studio demo --offline`** — author with NO cluster at all: a local stand-in
+  encoder (`scripts/offline_encoder.py`, same gradio protocol) serves
+  embeddings from `offline_cache/snapshots/*.npz` plus anything the demo
+  cached in past tunnel sessions. Constraints, duration, seeds, and sample
+  count are freely editable — only the prompt *text* needs a stored
+  embedding. A prompt not in the store generates text-ignoring motion and
+  prints a loud warning in the server terminal. The offline session uses an
+  isolated cache dir, so its zero-embeddings can never pollute the real
+  demo cache.
 - **Tunnel must be up before `studio demo`**: at startup the demo prewarms
   embeddings for all example prompts. `studio demo` pre-checks the tunnel and
   tells you what to start if it's down. Repeat prompts are free afterwards

@@ -12,7 +12,9 @@ Usage (tunnel up, e.g. after `studio tunnel <node>`):
 
 import argparse
 import os
+import shutil
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -62,6 +64,13 @@ def main():
         lengths=np.array(lengths, dtype=np.int64),
     )
     print(f"Saved {embeddings.shape} embeddings to {output_path}")
+
+    # also drop a copy where `studio demo --offline` auto-seeds from
+    snap_dir = Path(__file__).resolve().parents[1] / "offline_cache/snapshots"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    snap = snap_dir / f"{Path(args.batch_dir).resolve().name}.npz"
+    shutil.copy2(output_path, snap)
+    print(f"Snapshot for offline demo use: {snap}")
 
 
 if __name__ == "__main__":
