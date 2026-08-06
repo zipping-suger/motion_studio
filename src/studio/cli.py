@@ -165,6 +165,13 @@ def _run_tasks(run_dir: Path):
                        if task_root.is_dir() else [])
 
 
+def cmd_panel(cfg: Config, args) -> int:
+    cmd = [str(cfg.mppi_python), str(REPO_ROOT / "scripts/panel_app.py"),
+           "--port", str(args.port)]
+    print("+ " + " ".join(cmd), flush=True)
+    os.execv(cmd[0], cmd)
+
+
 def cmd_view(cfg: Config, args) -> int:
     run_dir = RUNS_DIR / args.name
     task_root, tasks = _run_tasks(run_dir)
@@ -244,6 +251,10 @@ def main() -> None:
     p.add_argument("example", help="example dir path / its name under the "
                                    "demo examples dir / a motion .npz file")
     p.set_defaults(func=cmd_run)
+    p = sub.add_parser("panel", help="interactive viser panel: reconstruct + "
+                                     "solve with tunable hyperparams")
+    p.add_argument("--port", type=int, default=8082)
+    p.set_defaults(func=cmd_panel)
     p = sub.add_parser("view", help="viser view of reference vs. result")
     p.add_argument("name", help="run name (see `studio list`)")
     p.add_argument("--port", type=int, default=8081)

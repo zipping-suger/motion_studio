@@ -46,11 +46,11 @@ def _copy_motion_npz(src: Path, dst: Path) -> None:
 
 def shim_example(example_dir: Path, run_dir: Path) -> Path:
     motion_dir = run_dir / "motion_0000"
-    motion_dir.mkdir()
+    motion_dir.mkdir(exist_ok=True)
     _copy_motion_npz(example_dir / "motion.npz",
                      motion_dir / "motion_0000_00.npz")
     inputs = run_dir / "batch_inputs/motion_0000"
-    inputs.mkdir(parents=True)
+    inputs.mkdir(parents=True, exist_ok=True)
     shutil.copy2(example_dir / "meta.json", inputs / "meta.json")
     constraints = example_dir / "constraints.json"
     if constraints.exists():
@@ -64,6 +64,6 @@ def shim_motion_npz(npz_path: Path, run_dir: Path) -> Path:
     No batch_inputs dir, so build_trial takes its flat naming path
     (<dir>_<clip>); grasp detection runs purely from kinematics."""
     motion_dir = run_dir / run_dir.name
-    motion_dir.mkdir()
+    motion_dir.mkdir(exist_ok=True)
     _copy_motion_npz(npz_path, motion_dir / f"{run_dir.name}_00.npz")
     return motion_dir

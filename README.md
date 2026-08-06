@@ -55,7 +55,12 @@ LIFT / DynaRetarget verdict.
 ```bash
 uv run studio list                      # runs + verdicts
 uv run studio view <name>               # viser: reference vs. result (:8081)
-uv run studio run <example-dir>         # process one example without watching
+uv run studio run <example-dir|npz>     # process one example / bare motion npz
+uv run studio panel                     # interactive tuning panel (:8082):
+                                        # pick a motion, click Reconstruct,
+                                        # tune scene + SBMPC hyperparams in
+                                        # the GUI, click Solve, watch ref vs
+                                        # solution; results are normal runs
 uv run studio promote <name>            # copy a good trial into mppi_locoma's
                                         # central outputs (paper dataset flow)
 ```
