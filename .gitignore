@@ -1,5 +1,6 @@
 runs/
 offline_cache/
+raw_motion/
 .venv*/
 __pycache__/
 *.pyc

@@ -137,9 +137,12 @@ def _resolve_example(cfg: Config, spec: str) -> Path | None:
 
 
 def cmd_run(cfg: Config, args) -> int:
+    src = Path(args.example)
+    if src.is_file() and src.suffix == ".npz":
+        return 0 if pipeline.process_example(cfg, src.resolve()) else 1
     example = _resolve_example(cfg, args.example)
     if example is None:
-        print(f"no example dir: {args.example} "
+        print(f"no example dir or .npz: {args.example} "
               f"(also tried under {cfg.examples_dir})", file=sys.stderr)
         return 1
     missing = [f for f in ("motion.npz", "meta.json")
@@ -236,9 +239,10 @@ def main() -> None:
     p.set_defaults(func=cmd_demo)
     sub.add_parser("watch", help="auto-process new Save Example dirs"
                    ).set_defaults(func=cmd_watch)
-    p = sub.add_parser("run", help="process one Save Example dir")
-    p.add_argument("example", help="example dir path, or its name under the "
-                                   "demo examples dir")
+    p = sub.add_parser("run", help="process a Save Example dir or a bare "
+                                   "motion .npz (demo's Save Motion)")
+    p.add_argument("example", help="example dir path / its name under the "
+                                   "demo examples dir / a motion .npz file")
     p.set_defaults(func=cmd_run)
     p = sub.add_parser("view", help="viser view of reference vs. result")
     p.add_argument("name", help="run name (see `studio list`)")

@@ -3,7 +3,7 @@ name = "kimodo-studio"
 version = "0.1.0"
 description = "Interactive Kimodo clip authoring -> dynamically feasible G1 trajectory via mppi_locoma"
 requires-python = ">=3.10"
-dependencies = ["pyyaml"]
+dependencies = ["pyyaml", "numpy"]
 
 [project.scripts]
 studio = "studio.cli:main"

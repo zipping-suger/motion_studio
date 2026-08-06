@@ -55,20 +55,28 @@ def retarget_overrides(cfg: Config) -> list[str]:
     return [ln for ln in out.stdout.splitlines() if ln.strip()]
 
 
-def process_example(cfg: Config, example_dir: Path) -> bool:
-    """Shim a Save Example dir into runs/<name>/ and run the full pipeline.
-    Returns True iff the retargeted clip passes the LIFT criterion."""
-    name = shim.sanitize(example_dir.name)
+def process_example(cfg: Config, source: Path) -> bool:
+    """Shim a Save Example dir OR a bare motion .npz into runs/<name>/ and
+    run the full pipeline. Returns True iff the retargeted clip passes the
+    LIFT criterion."""
+    is_npz = source.is_file()
+    name = shim.sanitize(source.stem if is_npz else source.name)
     run_dir = shim.make_run_dir(RUNS_DIR, name)
-    shim.shim_example(example_dir, run_dir)
+    if is_npz:
+        motion_dir = shim.shim_motion_npz(source, run_dir)
+        prompt = seed = None
+    else:
+        motion_dir = shim.shim_example(source, run_dir)
+        meta = json.loads((source / "meta.json").read_text())
+        prompt = meta.get("text") or meta.get("texts")
+        seed = meta.get("seed")
 
-    meta = json.loads((example_dir / "meta.json").read_text())
     manifest.update(run_dir, {
         "name": run_dir.name,
-        "source": str(example_dir),
+        "source": str(source),
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "prompt": meta.get("text") or meta.get("texts"),
-        "seed": meta.get("seed"),
+        "prompt": prompt,
+        "seed": seed,
         "git": {
             "kimodo": manifest.git_state(cfg.kimodo_repo),
             "mppi_locoma": manifest.git_state(cfg.mppi_locoma),
@@ -77,10 +85,10 @@ def process_example(cfg: Config, example_dir: Path) -> bool:
         "mppi_config": yaml.safe_load((cfg.mppi_locoma / "config.yml").read_text()),
     })
     print(f"run dir: {run_dir}")
-    return run_pipeline(cfg, run_dir)
+    return run_pipeline(cfg, run_dir, motion_dir)
 
 
-def run_pipeline(cfg: Config, run_dir: Path) -> bool:
+def run_pipeline(cfg: Config, run_dir: Path, motion_dir: Path) -> bool:
     name = run_dir.name
     logs = run_dir / "logs"
     logs.mkdir(exist_ok=True)
@@ -90,7 +98,7 @@ def run_pipeline(cfg: Config, run_dir: Path) -> bool:
     print(f"=== 1/3 scene reconstruction ({name}) ===")
     rc = _stream(
         [cfg.mppi_python, cfg.mppi_locoma / "scripts/build_trial.py",
-         "--motion-dir", run_dir / "motion_0000", "--out-root", out_root],
+         "--motion-dir", motion_dir, "--out-root", out_root],
         cwd=cfg.mppi_locoma, log_path=logs / "build.log",
     )
     task_dirs = sorted(task_root.glob(f"{name}_*")) if task_root.exists() else []
