@@ -69,6 +69,13 @@ central outputs, which is exactly why studio runs are kept isolated.
 
 ## Gotchas
 
+- **Embeddings are not persisted by headless generation**: the demo caches
+  prompt embeddings (`~/.cache/kimodo_demo/embeddings`), but kimodo's
+  `batch_generate.py` fetches them transiently. While a tunnel is up, run
+  `.venv-kimodo/bin/python scripts/encode_via_api.py --batch_dir <dir>` once —
+  it writes `text_embeddings.npz` (auto-detected by `batch_generate.py`), and
+  that prompt never needs the cluster again, for any seed/duration/sample
+  count.
 - **Tunnel must be up before `studio demo`**: at startup the demo prewarms
   embeddings for all example prompts. `studio demo` pre-checks the tunnel and
   tells you what to start if it's down. Repeat prompts are free afterwards
