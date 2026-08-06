@@ -1,11 +1,11 @@
 """Interactive tuning panel: reconstruct + SBMPC-solve from viser buttons.
 
-Pick a motion (raw_motion/*.npz or a saved demo example), click
-"Reconstruct scene" (mppi_locoma build_trial with the scene params set in
-the GUI), inspect the reconstruction, tune SBMPC hyperparameters, click
-"Solve SBMPC" (run_mjwp), and watch reference (transparent) vs solution
-(solid) playback. Every action works inside an ordinary studio run dir
-(runs/<name>/), so list/view/promote all apply.
+Pick a motion from raw_motion/ (where the demo's local motion saves
+land), click "Reconstruct scene" (mppi_locoma build_trial with the scene
+params set in the GUI), inspect the reconstruction, tune SBMPC
+hyperparameters, click "Solve SBMPC" (run_mjwp), and watch reference
+(transparent) vs solution (solid) playback. Every action works inside an
+ordinary studio run dir (runs/<name>/), so list/view/promote all apply.
 
 Runs in mppi_locoma's venv (viser + mujoco): launch with `studio panel`.
 Visualization conventions mirror mppi_locoma/scripts/view_trial.py.
@@ -79,17 +79,14 @@ def hand_collision_geoms(scene_xml, qpos_traj):
     return meshes, poses
 
 
+RAW_MOTION_DIR = STUDIO_ROOT / "raw_motion"
+
+
 def list_sources():
-    out = {}
-    raw = STUDIO_ROOT / "raw_motion"
-    if raw.is_dir():
-        for f in sorted(raw.glob("*.npz")):
-            out[f"npz: {f.stem}"] = f
-    if CFG.examples_dir.is_dir():
-        for d in sorted(CFG.examples_dir.iterdir()):
-            if (d / "motion.npz").exists():
-                out[f"example: {d.name}"] = d
-    return out
+    # the demo's local motion saves land in raw_motion/ — that dir is the
+    # panel's single source of inputs
+    RAW_MOTION_DIR.mkdir(exist_ok=True)
+    return {f.stem: f for f in sorted(RAW_MOTION_DIR.glob("*.npz"))}
 
 
 class Panel:
@@ -128,7 +125,7 @@ class Panel:
     # ------------------------------------------------------------- GUI --
     def _build_gui(self):
         gui = self.server.gui
-        with gui.add_folder("Motion"):
+        with gui.add_folder(f"Motion ({RAW_MOTION_DIR.name}/)"):
             self.sources = list_sources()
             options = list(self.sources) or ["<none found>"]
             self.gui_source = gui.add_dropdown("source", options,
