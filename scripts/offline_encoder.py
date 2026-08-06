@@ -41,8 +41,9 @@ def seed_from_npz(cache: EmbeddingCache, npz_paths) -> int:
             data = np.load(p)
             for i, text in enumerate(data["texts"]):
                 key = cache._make_key(sanitize_texts([str(text)])[0])
-                if os.path.exists(cache._entry_path(key)):
-                    continue
+                # always overwrite: snapshots hold real embeddings, and the
+                # existing entry may be a zero vector cached during an
+                # earlier offline session's miss
                 length = int(data["lengths"][i])
                 cache._disk_save(
                     key, data["embeddings"][i, :length].astype(np.float32))
