@@ -46,10 +46,14 @@ def cmd_setup(cfg: Config, args) -> int:
 
 def cmd_tunnel(cfg: Config, args) -> int:
     fwd = f"{cfg.encoder_port}:localhost:{cfg.encoder_port}"
+    # accept-new: compute nodes rotate, and the connection already rides
+    # through the trusted login host
+    base = ["ssh", "-N", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ServerAliveInterval=30", "-o", "ExitOnForwardFailure=yes"]
     if args.node:
-        cmd = ["ssh", "-N", "-J", cfg.encoder_host, "-L", fwd, args.node]
+        cmd = base + ["-J", cfg.encoder_host, "-L", fwd, args.node]
     else:
-        cmd = ["ssh", "-N", "-L", fwd, cfg.encoder_host]
+        cmd = base + ["-L", fwd, cfg.encoder_host]
     print("+ " + " ".join(cmd) + "   (Ctrl+C to close)", flush=True)
     os.execvp("ssh", cmd)
 

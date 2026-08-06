@@ -44,4 +44,4 @@ apptainer exec \
   -B $HF_CACHE:/workspace/.cache/huggingface:rw \
   -B $WORKSPACE:/workspace:rw \
   $SIF \
-  python3 /workspace/kimodo/scripts/run_text_encoder_server.py
+  python3 -m kimodo.scripts.run_text_encoder_server
