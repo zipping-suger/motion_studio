@@ -40,7 +40,7 @@ import viser
 from viser.extras import ViserUrdf
 import yourdfpy
 
-from kimodo_loader import DOF_NAMES
+from kimodo_loader import DOF_NAMES, load_kimodo_npz
 from repo_config import G1_URDF, RETARGET_PARAMS, SCENE_DEFAULTS
 
 MESHES_DIR = str(Path(spider.ROOT) / "assets/robots/unitree_g1/meshes")
@@ -169,6 +169,10 @@ class Panel:
             self.gui_play = gui.add_checkbox("play", True)
             self.gui_speed = gui.add_slider("speed", 0.1, 2.0, 0.1, 1.0)
 
+        @self.gui_source.on_update
+        def _(_):
+            self._spawn(self.do_preview)
+
         @self.btn_recon.on_click
         def _(_):
             self._spawn(self.do_reconstruct)
@@ -176,6 +180,8 @@ class Panel:
         @self.btn_solve.on_click
         def _(_):
             self._spawn(self.do_solve)
+
+        self._spawn(self.do_preview)  # preview the initial selection
 
     def _spawn(self, fn):
         if self.busy:
@@ -186,6 +192,40 @@ class Panel:
         self.busy = busy
         self.btn_recon.disabled = busy
         self.btn_solve.disabled = busy or self.task_dir is None
+
+    # --------------------------------------------------------- preview --
+    def do_preview(self):
+        """Play the raw kinematic motion (robot only) on source selection."""
+        source = self.sources.get(self.gui_source.value)
+        if source is None:
+            return
+        self._set_busy(True)
+        try:
+            qpos, _ = load_kimodo_npz(source, use_smooth_pos=False)  # (T,36)
+            self.ref_qpos = None
+            self.res_qpos = None
+            self.task_dir = None  # solve needs a fresh reconstruction
+            for h in self.scene_handles + self.hand_handles:
+                h.remove()
+            self.scene_handles, self.hand_handles = [], []
+            if self.res_base is not None:
+                self.res_base.visible = False
+            if self.res_box is not None:
+                self.res_box.remove()
+                self.res_box = None
+            if self.ref_box is not None:
+                self.ref_box.remove()
+                self.ref_box = None
+            self.ref_base.visible = True
+            self.gui_frame.value = 0.0
+            self.ref_qpos = qpos  # publish LAST
+            self.md_recon.content = (f"*previewing raw motion `{source.stem}`"
+                                     " — reconstruct to add the scene*")
+            self.md_solve.content = "*reconstruct first*"
+        except Exception as e:
+            self.md_recon.content = f"**preview failed**: {e}"
+        finally:
+            self._set_busy(False)
 
     # ----------------------------------------------------- reconstruct --
     def do_reconstruct(self):
@@ -375,31 +415,38 @@ class Panel:
     def tick(self):
         # snapshot: worker threads swap these while we run
         q, ref_box = self.ref_qpos, self.ref_box
-        if q is None or ref_box is None:
+        if q is None:
             return
         T = len(q)
         if self.gui_play.value:
             self.gui_frame.value = (self.gui_frame.value
                                     + 1.0 / max(T - 1, 1)) % 1.0
         t = min(int(self.gui_frame.value * (T - 1)), T - 1)
-        self.ref_base.position = q[t, :3]
-        self.ref_base.wxyz = q[t, 3:7]
-        self.ref_vis.update_cfg(q[t, 7:36][self.order])
-        ref_box.position = q[t, 36:39]
-        ref_box.wxyz = q[t, 39:43]
-        r, res_box = self.res_qpos, self.res_box
-        hand_poses, hand_handles = self.hand_poses, self.hand_handles
-        if r is not None and self.res_base is not None and res_box is not None:
-            s = min(t * 2, len(r) - 1)  # result 60 Hz vs ref 30
-            self.res_base.position = r[s, :3]
-            self.res_base.wxyz = r[s, 3:7]
-            self.res_vis.update_cfg(r[s, 7:36][self.order])
-            res_box.position = r[s, 36:39]
-            res_box.wxyz = r[s, 39:43]
-            if hand_poses is not None and len(hand_poses) == len(r):
-                for k, h in enumerate(hand_handles):
-                    h.position = hand_poses[s, k, :3]
-                    h.wxyz = hand_poses[s, k, 3:]
+        try:
+            self.ref_base.position = q[t, :3]
+            self.ref_base.wxyz = q[t, 3:7]
+            self.ref_vis.update_cfg(q[t, 7:36][self.order])
+            if q.shape[1] > 36 and ref_box is not None:  # reconstructed ref
+                ref_box.position = q[t, 36:39]
+                ref_box.wxyz = q[t, 39:43]
+            r, res_box = self.res_qpos, self.res_box
+            hand_poses, hand_handles = self.hand_poses, self.hand_handles
+            if (r is not None and self.res_base is not None
+                    and res_box is not None):
+                s = min(t * 2, len(r) - 1)  # result 60 Hz vs ref 30
+                self.res_base.position = r[s, :3]
+                self.res_base.wxyz = r[s, 3:7]
+                self.res_vis.update_cfg(r[s, 7:36][self.order])
+                res_box.position = r[s, 36:39]
+                res_box.wxyz = r[s, 39:43]
+                if hand_poses is not None and len(hand_poses) == len(r):
+                    for k, h in enumerate(hand_handles):
+                        h.position = hand_poses[s, k, :3]
+                        h.wxyz = hand_poses[s, k, 3:]
+        except RuntimeError:
+            # a worker replaced a snapshotted handle mid-frame; the next
+            # tick renders the fresh state
+            pass
 
 
 def main():
