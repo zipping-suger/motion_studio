@@ -1,0 +1,15 @@
+# kimodo_studio configuration: external paths and connection settings.
+paths:
+  kimodo_repo: /home/zippingsugar/Programs/kimodo
+  # dedicated venv for kimodo, created by `studio setup`
+  kimodo_python: /home/zippingsugar/Programs/kimodo_studio/.venv-kimodo/bin/python
+  mppi_locoma: /home/zippingsugar/Programs/humanoid_project/experiments/mppi_locoma
+
+demo:
+  model: Kimodo-G1-RP-v1
+  port: 7860
+
+encoder:
+  # ssh alias of the cluster login node; `studio tunnel <node>` jumps through it
+  remote_host: euler
+  port: 9550
