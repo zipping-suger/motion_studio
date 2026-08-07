@@ -68,8 +68,9 @@ uv run studio panel                     # tuning panel (:8082): pick a motion
                                         # SBMPC hyperparams, Solve, watch ref
                                         # vs solution; results = normal runs
 uv run studio recon <npz|example>       # scene reconstruction only, from the
-                                        # CLI (--name X, extra flags pass to
-                                        # build_trial, e.g. --box-mass 0.5);
+                                        # CLI (--name X; extra flags pass to
+                                        # scripts/recon_core.py, e.g.
+                                        # --box-mass 0.5 --pick-frame 0);
                                         # reuses runs/<name>/ for iteration
 uv run studio list                      # runs + verdicts
 uv run studio view <name>               # viser: reference vs. result (:8081)
@@ -113,6 +114,16 @@ central outputs, which is exactly why studio runs are kept isolated.
 - **Reach-only clips are SKIPPED**: scene reconstruction infers the object
   from pick/carry hand kinematics; a motion with no object interaction has no
   scene to build. That's a verdict, not a bug.
+- **The contact window is editable**: reconstruction hinges on the pick →
+  release period (it sets the box rest pose, the width, and the frames the
+  solver rewards palm contact). The panel auto-detects it on preview and
+  shows an orange **ghost box** riding the hands — the exact object
+  trajectory the window implies. Drag `contact start`/`contact end` until
+  the ghost looks right, then Reconstruct ("auto window" re-detects). In
+  the demo, `contact start`/`contact end` of -1 mean auto; set frames to
+  override. Manual `contact start` 0 implies a held start. Reconstruction
+  runs via `scripts/recon_core.py` (mppi_locoma used as a library,
+  unmodified).
 - **Clips that start mid-hold** (hands already on the box at frame 0) are
   also SKIPPED by default — there is no rest pose to infer, so the box lands
   where the hands already are and the spawn check kills it. Tick **"allow

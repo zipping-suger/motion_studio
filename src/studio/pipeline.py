@@ -98,7 +98,9 @@ def process_example(cfg: Config, source: Path) -> bool:
 
 def reconstruct(cfg: Config, run_dir: Path, motion_dir: Path,
                 scene_flags: list[str] | None = None) -> list[Path]:
-    """Stage 1 only: build_trial into run_dir/outputs. Returns task dirs
+    """Stage 1 only: scene reconstruction into run_dir/outputs via
+    scripts/recon_core.py (mppi_locoma as a library — adds the manual
+    contact-window override that build_trial.py lacks). Returns task dirs
     ([] on failure/skip; the verdict lands in the manifest)."""
     name = run_dir.name
     logs = run_dir / "logs"
@@ -106,11 +108,16 @@ def reconstruct(cfg: Config, run_dir: Path, motion_dir: Path,
     out_root = run_dir / "outputs"
     task_root = out_root / TASK_SUBTREE
 
+    # task naming mirrors build_trial.py: nested (Save Example shim) vs flat
+    npz = next(iter(sorted(motion_dir.glob("*.npz"))))
+    nested = (motion_dir.parent / "batch_inputs").is_dir()
+    task = (f"{name}_{motion_dir.name.split('_')[-1]}_00" if nested
+            else f"{name}_00")
+
     print(f"=== scene reconstruction ({name}) ===")
     rc = _stream(
-        [cfg.mppi_python, cfg.mppi_locoma / "scripts/build_trial.py",
-         "--motion-dir", motion_dir, "--out-root", out_root,
-         *(scene_flags or [])],
+        [cfg.mppi_python, REPO_ROOT / "scripts/recon_core.py", npz,
+         "--out-root", out_root, "--task", task, *(scene_flags or [])],
         cwd=cfg.mppi_locoma, log_path=logs / "build.log",
     )
     task_dirs = sorted(task_root.glob(f"{name}_*")) if task_root.exists() else []

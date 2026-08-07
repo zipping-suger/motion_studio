@@ -42,7 +42,11 @@ import viser
 from viser.extras import ViserUrdf
 import yourdfpy
 
-from kimodo_loader import DOF_NAMES, load_kimodo_npz
+import recon_core
+from grasp_detect import (HAND_SURFACE_OFFSET, BOX_WIDTH_MIN, BOX_WIDTH_MAX,
+                          _smooth, detect_grasp)
+from kimodo_loader import (DOF_NAMES, KIM_LEFT_HAND_TIP, KIM_RIGHT_HAND_TIP,
+                           load_kimodo_npz)
 from repo_config import G1_URDF, RETARGET_PARAMS, SCENE_DEFAULTS
 
 MESHES_DIR = str(Path(spider.ROOT) / "assets/robots/unitree_g1/meshes")
@@ -102,6 +106,12 @@ class Panel:
         self.hand_handles = []
         self.scene_handles = []
         self.busy = False
+        # contact-window preview state (only while previewing a raw motion)
+        self.auto_window = None     # (pick, release) as detected
+        self.ghost = None           # {"pick","rel"} — publish LAST
+        self.ghost_box = None
+        self._mid = self._yaw = self._gap = None
+        self._suppress_window_cb = False
 
         server.scene.add_grid("/ground", width=6, height=6)
         self.ref_box = None
@@ -151,6 +161,11 @@ class Panel:
                     self.scene_widgets[key] = gui.add_number(
                         key, float(val), min=0.0, step=0.005)
             self.gui_held = gui.add_checkbox("allow held start", False)
+            # contact window: auto-detected on preview, freely editable;
+            # the ghost box shows the object trajectory it implies
+            self.gui_cstart = gui.add_number("contact start", 0, min=0, step=1)
+            self.gui_cend = gui.add_number("contact end", 0, min=0, step=1)
+            self.btn_auto = gui.add_button("auto window")
             self.btn_recon = gui.add_button("1. Reconstruct scene")
             self.md_recon = gui.add_markdown("*no reconstruction yet*")
 
@@ -176,6 +191,25 @@ class Panel:
         @self.gui_source.on_update
         def _(_):
             self._spawn(self.do_preview)
+
+        @self.gui_held.on_update
+        def _(_):
+            if self.ghost is not None:  # re-detect under the new mode
+                self._spawn(self.do_preview)
+
+        @self.btn_auto.on_click
+        def _(_):
+            self._spawn(self.do_preview)  # re-detect + reset the window
+
+        @self.gui_cstart.on_update
+        def _(_):
+            if not self._suppress_window_cb:
+                self._rebuild_ghost()
+
+        @self.gui_cend.on_update
+        def _(_):
+            if not self._suppress_window_cb:
+                self._rebuild_ghost()
 
         @self.btn_recon.on_click
         def _(_):
@@ -205,10 +239,11 @@ class Panel:
             return
         self._set_busy(True)
         try:
-            qpos, _ = load_kimodo_npz(source, use_smooth_pos=False)  # (T,36)
+            qpos, meta = load_kimodo_npz(source, use_smooth_pos=False)  # (T,36)
             self.ref_qpos = None
             self.res_qpos = None
             self.task_dir = None  # solve needs a fresh reconstruction
+            self._clear_ghost()
             for h in self.scene_handles + self.hand_handles:
                 h.remove()
             self.scene_handles, self.hand_handles = [], []
@@ -223,13 +258,63 @@ class Panel:
             self.ref_base.visible = True
             self.gui_frame.value = 0.0
             self.ref_qpos = qpos  # publish LAST
-            self.md_recon.content = (f"*previewing raw motion `{source.stem}`"
-                                     " — reconstruct to add the scene*")
+
+            # detect the contact window + precompute the hand-midpoint
+            # track for the ghost box (mirrors build_object_trajectory)
+            grasp = detect_grasp(meta, qpos, {},
+                                 allow_held_start=self.gui_held.value)
+            jp = meta["joint_positions"]
+            lh, rh = jp[:, KIM_LEFT_HAND_TIP], jp[:, KIM_RIGHT_HAND_TIP]
+            mid = 0.5 * (lh + rh)
+            mid = np.stack([_smooth(mid[:, i], 5) for i in range(3)], axis=1)
+            axis = lh - rh
+            yaw = _smooth(np.unwrap(np.arctan2(axis[:, 1], axis[:, 0])), 9)
+            self._gap = np.linalg.norm(lh - rh, axis=1)
+            self._mid, self._yaw = mid, yaw
+            self.auto_window = (grasp.pick_frame, grasp.release_frame)
+            self._suppress_window_cb = True
+            self.gui_cstart.value = grasp.pick_frame
+            self.gui_cend.value = grasp.release_frame
+            self._suppress_window_cb = False
+            self._rebuild_ghost()
+            self.md_recon.content = (
+                f"*previewing `{source.stem}` — auto contact window "
+                f"f{grasp.pick_frame}–f{grasp.release_frame} "
+                f"(flags: {','.join(grasp.quality_flags) or '-'}); the "
+                "orange ghost box shows the scene the window implies*")
             self.md_solve.content = "*reconstruct first*"
         except Exception as e:
             self.md_recon.content = f"**preview failed**: {e}"
         finally:
             self._set_busy(False)
+
+    def _clear_ghost(self):
+        self.ghost = None  # unpublish before touching the handle
+        if self.ghost_box is not None:
+            self.ghost_box.remove()
+            self.ghost_box = None
+
+    def _rebuild_ghost(self):
+        """(Re)create the ghost box for the current contact window: width
+        from the window's median hand gap, pose riding the hand midpoint —
+        exactly the object trajectory reconstruction will build."""
+        if self._mid is None or self.ref_qpos is None:
+            return
+        T = len(self._mid)
+        pick = int(np.clip(self.gui_cstart.value, 0, T - 2))
+        rel = int(np.clip(self.gui_cend.value, pick + 1, T - 1))
+        self._clear_ghost()
+        width = float(np.clip(
+            np.median(self._gap[pick:rel + 1]) - 2 * HAND_SURFACE_OFFSET,
+            BOX_WIDTH_MIN, BOX_WIDTH_MAX))
+        mesh = trimesh.creation.box(
+            (width, float(self.scene_widgets["box_depth"].value),
+             float(self.scene_widgets["box_height"].value)))
+        self.ghost_box = self.server.scene.add_mesh_simple(
+            "/ghost_box", mesh.vertices, mesh.faces,
+            color=(240, 160, 40), opacity=0.35,
+            position=self._mid[pick], wxyz=(1.0, 0, 0, 0))
+        self.ghost = {"pick": pick, "rel": rel}  # publish LAST
 
     # ----------------------------------------------------- reconstruct --
     def do_reconstruct(self):
@@ -243,43 +328,47 @@ class Panel:
             run_dir = RUNS_DIR / name
             run_dir.mkdir(parents=True, exist_ok=True)
             motion_dir = shim.shim_motion_npz(source, run_dir)
+            npz = motion_dir / f"{name}_00.npz"
 
             scene_params = {k: w.value for k, w in self.scene_widgets.items()}
-            flags = []
-            for k, v in scene_params.items():
-                flags += [f"--{k.replace('_', '-')}", str(v)]
             if self.gui_held.value:
-                flags.append("--allow-held-start")
                 scene_params["allow_held_start"] = True
-            out_root = run_dir / "outputs"
-            proc = subprocess.run(
-                [str(CFG.mppi_python),
-                 str(CFG.mppi_locoma / "scripts/build_trial.py"),
-                 "--motion-dir", str(motion_dir), "--out-root", str(out_root),
-                 *flags],
-                cwd=str(CFG.mppi_locoma), capture_output=True, text=True)
-            result_line = next(
-                (ln for ln in proc.stdout.splitlines() if "pick f" in ln),
-                proc.stdout.strip().splitlines()[-1] if proc.stdout.strip()
-                else proc.stderr.strip().splitlines()[-1] if proc.stderr.strip()
-                else "no output")
-            task_root = out_root / TASK_SUBTREE
-            tasks = (sorted(d for d in task_root.iterdir() if d.is_dir())
-                     if task_root.is_dir() else [])
-            if proc.returncode != 0 or not tasks or "SKIPPED" in result_line:
-                self.md_recon.content = f"**failed/skipped**\n```\n{result_line}\n```"
+            pick = int(self.gui_cstart.value)
+            rel = int(self.gui_cend.value)
+            # only force the window when the user moved it off the detected
+            # values — the detector's own window end differs from release,
+            # so a no-op override would still shift the width slightly
+            override = (self.auto_window is not None
+                        and (pick, rel) != self.auto_window)
+            if override:
+                scene_params["contact_window"] = [pick, rel]
+            try:
+                task_dir, _, line = recon_core.reconstruct(
+                    npz, run_dir / "outputs", f"{name}_00",
+                    {k: v for k, v in scene_params.items()
+                     if k in SCENE_DEFAULTS},
+                    allow_held_start=self.gui_held.value,
+                    pick=pick if override else None,
+                    release=rel if override else None)
+            except Exception as e:
+                self.md_recon.content = f"**reconstruction crashed**: {e}"
                 self.task_dir = None
                 return
-            self.run_dir, self.task_dir = run_dir, tasks[0]
+            if task_dir is None:
+                self.md_recon.content = f"**failed/skipped**\n```\n{line}\n```"
+                self.task_dir = None
+                return
+            self.run_dir, self.task_dir = run_dir, task_dir
             manifest.update(run_dir, {"name": name, "source": str(source),
                                       "panel_scene_params": scene_params})
             self._load_reference()
-            self.md_recon.content = f"```\n{result_line.split(' -> ')[0]}\n```"
+            self.md_recon.content = f"```\n{line.split(' -> ')[0]}\n```"
             self.md_solve.content = "*ready to solve*"
         finally:
             self._set_busy(False)
 
     def _load_reference(self):
+        self._clear_ghost()  # the real reconstructed box replaces it
         info = json.loads((self.task_dir / "task_info.json").read_text())
         ref_qpos = np.load(
             self.task_dir / "0/trajectory_kinematic.npz")["qpos"]
@@ -449,6 +538,14 @@ class Panel:
             if q.shape[1] > 36 and ref_box is not None:  # reconstructed ref
                 ref_box.position = q[t, 36:39]
                 ref_box.wxyz = q[t, 39:43]
+            g, gb = self.ghost, self.ghost_box
+            if q.shape[1] == 36 and g is not None and gb is not None:
+                # rest at the pick pose, ride the hands inside the window,
+                # freeze at release — build_object_trajectory's rule
+                s = min(max(t, g["pick"]), g["rel"])
+                gb.position = self._mid[s]
+                half = self._yaw[s] / 2
+                gb.wxyz = np.array([np.cos(half), 0.0, 0.0, np.sin(half)])
             r, res_box = self.res_qpos, self.res_box
             hand_poses, hand_handles = self.hand_poses, self.hand_handles
             if (r is not None and self.res_base is not None

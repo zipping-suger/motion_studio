@@ -80,6 +80,12 @@ class SceneReconAddon:
                     self.scene_widgets[key] = gui.add_number(
                         key, float(val), min=0.0, step=0.005)
             self.gui_held = gui.add_checkbox("allow held start", False)
+            # contact window override; -1 = auto-detect. The reconstruct
+            # status line reports the window actually used — set these to
+            # correct it and re-click.
+            self.gui_cstart = gui.add_number("contact start", -1, min=-1,
+                                             step=1)
+            self.gui_cend = gui.add_number("contact end", -1, min=-1, step=1)
             self.gui_show = gui.add_checkbox("show scene", True)
             self.btn = gui.add_button("Reconstruct scene", color="teal")
             self.md = gui.add_markdown(
@@ -131,6 +137,10 @@ class SceneReconAddon:
                 # clip begins mid-hold: box spawns in the hands, no rest
                 # pose or support inferred
                 flags.append("--allow-held-start")
+            if int(self.gui_cstart.value) >= 0:
+                flags += ["--pick-frame", str(int(self.gui_cstart.value))]
+            if int(self.gui_cend.value) >= 0:
+                flags += ["--release-frame", str(int(self.gui_cend.value))]
             proc = subprocess.run(
                 [str(STUDIO_BIN), "recon", str(npz_path), "--name", name,
                  *flags],
