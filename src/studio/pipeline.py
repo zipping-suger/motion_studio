@@ -55,14 +55,10 @@ def retarget_overrides(cfg: Config) -> list[str]:
     return [ln for ln in out.stdout.splitlines() if ln.strip()]
 
 
-def process_example(cfg: Config, source: Path) -> bool:
-    """Shim a Save Example dir OR a bare motion .npz into runs/<name>/ and
-    run the full pipeline. Returns True iff the retargeted clip passes the
-    LIFT criterion."""
-    is_npz = source.is_file()
-    name = shim.sanitize(source.stem if is_npz else source.name)
-    run_dir = shim.make_run_dir(RUNS_DIR, name)
-    if is_npz:
+def _shim_source(cfg: Config, source: Path, run_dir: Path) -> Path:
+    """Shim a Save Example dir OR a bare motion .npz into run_dir and
+    record provenance in the manifest. Returns the motion dir."""
+    if source.is_file():
         motion_dir = shim.shim_motion_npz(source, run_dir)
         prompt = seed = None
     else:
@@ -84,8 +80,69 @@ def process_example(cfg: Config, source: Path) -> bool:
         },
         "mppi_config": yaml.safe_load((cfg.mppi_locoma / "config.yml").read_text()),
     })
+    return motion_dir
+
+
+def process_example(cfg: Config, source: Path) -> bool:
+    """Shim a Save Example dir OR a bare motion .npz into runs/<name>/ and
+    run the full pipeline. Returns True iff the retargeted clip passes the
+    LIFT criterion."""
+    name = shim.sanitize(source.stem if source.is_file() else source.name)
+    run_dir = shim.make_run_dir(RUNS_DIR, name)
+    motion_dir = _shim_source(cfg, source, run_dir)
     print(f"run dir: {run_dir}")
     return run_pipeline(cfg, run_dir, motion_dir)
+
+
+def reconstruct(cfg: Config, run_dir: Path, motion_dir: Path,
+                scene_flags: list[str] | None = None) -> list[Path]:
+    """Stage 1 only: build_trial into run_dir/outputs. Returns task dirs
+    ([] on failure/skip; the verdict lands in the manifest)."""
+    name = run_dir.name
+    logs = run_dir / "logs"
+    logs.mkdir(exist_ok=True)
+    out_root = run_dir / "outputs"
+    task_root = out_root / TASK_SUBTREE
+
+    print(f"=== scene reconstruction ({name}) ===")
+    rc = _stream(
+        [cfg.mppi_python, cfg.mppi_locoma / "scripts/build_trial.py",
+         "--motion-dir", motion_dir, "--out-root", out_root,
+         *(scene_flags or [])],
+        cwd=cfg.mppi_locoma, log_path=logs / "build.log",
+    )
+    task_dirs = sorted(task_root.glob(f"{name}_*")) if task_root.exists() else []
+    if rc != 0 or not task_dirs:
+        verdict = "error" if rc != 0 else "skipped"
+        print(f"reconstruction {verdict}"
+              + ("" if rc == 0 else f" (see {logs / 'build.log'})"))
+        manifest.update(run_dir, {"verdict": verdict})
+        return []
+    manifest.update(run_dir, {"tasks": [d.name for d in task_dirs]})
+    return task_dirs
+
+
+def recon_example(cfg: Config, source: Path, name: str | None = None,
+                  scene_flags: list[str] | None = None) -> Path | None:
+    """Shim + scene reconstruction only, no solve. Unlike process_example
+    this REUSES runs/<name>/ so scene params can be iterated on the same
+    clip (the solve panel then picks the run up). Returns the run dir on
+    success."""
+    name = shim.sanitize(name or (source.stem if source.is_file()
+                                  else source.name))
+    run_dir = RUNS_DIR / name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    motion_dir = _shim_source(cfg, source, run_dir)
+    if scene_flags:
+        manifest.update(run_dir, {"scene_flags": scene_flags})
+    print(f"run dir: {run_dir}")
+    task_dirs = reconstruct(cfg, run_dir, motion_dir, scene_flags)
+    if not task_dirs:
+        return None
+    manifest.update(run_dir, {"verdict": "recon"})
+    print(f"reconstructed: {', '.join(d.name for d in task_dirs)}   "
+          f"(solve: studio panel)")
+    return run_dir
 
 
 def run_pipeline(cfg: Config, run_dir: Path, motion_dir: Path) -> bool:
@@ -95,25 +152,14 @@ def run_pipeline(cfg: Config, run_dir: Path, motion_dir: Path) -> bool:
     out_root = run_dir / "outputs"
     task_root = out_root / TASK_SUBTREE
 
-    print(f"=== 1/3 scene reconstruction ({name}) ===")
-    rc = _stream(
-        [cfg.mppi_python, cfg.mppi_locoma / "scripts/build_trial.py",
-         "--motion-dir", motion_dir, "--out-root", out_root],
-        cwd=cfg.mppi_locoma, log_path=logs / "build.log",
-    )
-    task_dirs = sorted(task_root.glob(f"{name}_*")) if task_root.exists() else []
-    if rc != 0 or not task_dirs:
-        verdict = "error" if rc != 0 else "skipped"
-        print(f"reconstruction {verdict}"
-              + ("" if rc == 0 else f" (see {logs / 'build.log'})"))
-        manifest.update(run_dir, {"verdict": verdict})
+    task_dirs = reconstruct(cfg, run_dir, motion_dir)
+    if not task_dirs:
         return False
-    manifest.update(run_dir, {"tasks": [d.name for d in task_dirs]})
 
     overrides = retarget_overrides(cfg)
     for task_dir in task_dirs:
         task = task_dir.name
-        print(f"=== 2/3 SPIDER retargeting: {task} ===")
+        print(f"=== SPIDER retargeting: {task} ===")
         rc = _stream(
             [cfg.mppi_python, cfg.mppi_locoma / "retarget/run_mjwp.py",
              "+override=kimodo_pick", f"task={task}", f"dataset_dir={out_root}",
@@ -127,7 +173,7 @@ def run_pipeline(cfg: Config, run_dir: Path, motion_dir: Path) -> bool:
             manifest.update(run_dir, {"verdict": "error"})
             return False
 
-    print("=== 3/3 evaluation ===")
+    print("=== evaluation ===")
     out = subprocess.run(
         [str(cfg.mppi_python), str(cfg.mppi_locoma / "scripts/eval_trials.py"),
          "--root", str(task_root), "--filter", f"{name}_"],

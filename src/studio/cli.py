@@ -122,8 +122,11 @@ def cmd_demo(cfg: Config, args) -> int:
           f"Save Example dir (watched by `studio watch`): {cfg.examples_dir}",
           flush=True)
     try:
+        # the add-on wraps the stock demo: same UI + a scene-recon folder
         return subprocess.run(
-            [str(demo_bin), "--model", cfg.model], env=env).returncode
+            [str(cfg.kimodo_python),
+             str(REPO_ROOT / "scripts/demo_scene_addon.py"),
+             "--model", cfg.model], env=env).returncode
     finally:
         if server is not None:
             server.terminate()
@@ -152,6 +155,21 @@ def cmd_run(cfg: Config, args) -> int:
               file=sys.stderr)
         return 1
     return 0 if pipeline.process_example(cfg, example) else 1
+
+
+def cmd_recon(cfg: Config, args) -> int:
+    src = Path(args.source)
+    if not (src.is_file() and src.suffix == ".npz"):
+        resolved = _resolve_example(cfg, args.source)
+        if resolved is None:
+            print(f"no example dir or .npz: {args.source} "
+                  f"(also tried under {cfg.examples_dir})", file=sys.stderr)
+            return 1
+        src = resolved
+    flags = [f for f in args.build_flags if f != "--"]
+    run_dir = pipeline.recon_example(cfg, src.resolve(), name=args.name,
+                                     scene_flags=flags)
+    return 0 if run_dir is not None else 1
 
 
 def cmd_watch(cfg: Config, args) -> int:
@@ -251,6 +269,15 @@ def main() -> None:
     p.add_argument("example", help="example dir path / its name under the "
                                    "demo examples dir / a motion .npz file")
     p.set_defaults(func=cmd_run)
+    p = sub.add_parser(
+        "recon", help="scene reconstruction only (no solve): shim into "
+                      "runs/<name>/ + build_trial; reuses the run dir so "
+                      "scene params can be iterated")
+    p.add_argument("source", help="motion .npz / example dir")
+    p.add_argument("--name", default=None,
+                   help="run name (default: derived from the source)")
+    # unrecognized flags (e.g. --box-mass 0.5) pass through to build_trial.py
+    p.set_defaults(func=cmd_recon, passthrough=True)
     p = sub.add_parser("panel", help="interactive viser panel: reconstruct + "
                                      "solve with tunable hyperparams")
     p.add_argument("--port", type=int, default=8082)
@@ -267,5 +294,9 @@ def main() -> None:
     p.add_argument("name")
     p.set_defaults(func=cmd_promote)
 
-    args = ap.parse_args()
+    args, extra = ap.parse_known_args()
+    if getattr(args, "passthrough", False):
+        args.build_flags = [f for f in extra if f != "--"]
+    elif extra:
+        ap.error(f"unrecognized arguments: {' '.join(extra)}")
     sys.exit(args.func(load_config(), args))

@@ -48,19 +48,30 @@ uv run studio watch
 
 In the browser: write a prompt (and optional timeline constraints), generate,
 **click the sample you like** (with `num_samples > 1` the save buttons stay
-disabled until you commit a sample by clicking it), then **Save Example**.
-The watcher picks it up, reconstructs the scene, retargets, and prints the
-LIFT / DynaRetarget verdict.
+disabled until you commit a sample by clicking it). Then either:
+
+- **Verify in place**: the demo has a **"Scene recon (mppi)"** folder — set a
+  run name (+ scene params), click **Reconstruct scene**, and the
+  reconstructed table/terrain/box overlays the playing motion right in the
+  demo viewer (recon is a CPU subprocess, no VRAM cost). It saves the motion
+  to `raw_motion/<name>.npz` and the built trial to `runs/<name>/`, ready for
+  the solve panel.
+- **Save Example** for the classic watcher flow: `studio watch` picks it up,
+  reconstructs, retargets, and prints the LIFT / DynaRetarget verdict.
 
 ```bash
+uv run studio panel                     # SBMPC solve panel (:8082): pick a
+                                        # reconstructed run, inspect ref
+                                        # motion in its scene, tune SBMPC
+                                        # hyperparams, click Solve, watch ref
+                                        # vs solution; results = normal runs
+uv run studio recon <npz|example>       # scene reconstruction only, from the
+                                        # CLI (--name X, extra flags pass to
+                                        # build_trial, e.g. --box-mass 0.5);
+                                        # reuses runs/<name>/ for iteration
 uv run studio list                      # runs + verdicts
 uv run studio view <name>               # viser: reference vs. result (:8081)
-uv run studio run <example-dir|npz>     # process one example / bare motion npz
-uv run studio panel                     # interactive tuning panel (:8082):
-                                        # pick a motion, click Reconstruct,
-                                        # tune scene + SBMPC hyperparams in
-                                        # the GUI, click Solve, watch ref vs
-                                        # solution; results are normal runs
+uv run studio run <example-dir|npz>     # full pipeline for one example/npz
 uv run studio promote <name>            # copy a good trial into mppi_locoma's
                                         # central outputs (paper dataset flow)
 ```

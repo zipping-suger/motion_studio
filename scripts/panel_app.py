@@ -1,11 +1,12 @@
-"""Interactive tuning panel: reconstruct + SBMPC-solve from viser buttons.
+"""SBMPC solve panel: solve reconstructed runs from viser buttons.
 
-Pick a motion from raw_motion/ (where the demo's local motion saves
-land), click "Reconstruct scene" (mppi_locoma build_trial with the scene
-params set in the GUI), inspect the reconstruction, tune SBMPC
-hyperparameters, click "Solve SBMPC" (run_mjwp), and watch reference
-(transparent) vs solution (solid) playback. Every action works inside an
-ordinary studio run dir (runs/<name>/), so list/view/promote all apply.
+Scene reconstruction lives in the demo viser now (`studio demo`'s
+"Scene recon (mppi)" folder, or `studio recon` on the CLI); this panel is
+solve-only. Pick a built run from runs/, inspect the reference motion in
+its reconstructed scene, tune SBMPC hyperparameters, click "Solve SBMPC"
+(run_mjwp), and watch reference (transparent) vs solution (solid)
+playback. Every action works inside an ordinary studio run dir
+(runs/<name>/), so list/view/promote all apply.
 
 Runs in mppi_locoma's venv (viser + mujoco): launch with `studio panel`.
 Visualization conventions mirror mppi_locoma/scripts/view_trial.py.
@@ -28,7 +29,7 @@ import yaml
 STUDIO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(STUDIO_ROOT / "src"))
 
-from studio import manifest, shim
+from studio import manifest
 from studio.config import RUNS_DIR, TASK_SUBTREE, load_config
 
 CFG = load_config()
@@ -40,8 +41,8 @@ import viser
 from viser.extras import ViserUrdf
 import yourdfpy
 
-from kimodo_loader import DOF_NAMES, load_kimodo_npz
-from repo_config import G1_URDF, RETARGET_PARAMS, SCENE_DEFAULTS
+from kimodo_loader import DOF_NAMES
+from repo_config import G1_URDF, RETARGET_PARAMS
 
 MESHES_DIR = str(Path(spider.ROOT) / "assets/robots/unitree_g1/meshes")
 INT_KEYS = {"num_samples", "max_num_iterations"}
@@ -79,14 +80,20 @@ def hand_collision_geoms(scene_xml, qpos_traj):
     return meshes, poses
 
 
-RAW_MOTION_DIR = STUDIO_ROOT / "raw_motion"
-
-
 def list_sources():
-    # the demo's local motion saves land in raw_motion/ — that dir is the
-    # panel's single source of inputs
-    RAW_MOTION_DIR.mkdir(exist_ok=True)
-    return {f.stem: f for f in sorted(RAW_MOTION_DIR.glob("*.npz"))}
+    """Built runs ready to solve: runs/<name>/ with a reconstructed trial
+    (from the demo's Reconstruct button, `studio recon`, or a past full
+    run). Maps run name -> (run_dir, task_dir)."""
+    out = {}
+    for run_dir in sorted(RUNS_DIR.iterdir()) if RUNS_DIR.is_dir() else []:
+        task_root = run_dir / "outputs" / TASK_SUBTREE
+        if not task_root.is_dir():
+            continue
+        for task in sorted(d for d in task_root.iterdir() if d.is_dir()):
+            if (task / "0/trajectory_kinematic.npz").exists():
+                out[run_dir.name] = (run_dir, task)
+                break
+    return out
 
 
 class Panel:
@@ -125,31 +132,19 @@ class Panel:
     # ------------------------------------------------------------- GUI --
     def _build_gui(self):
         gui = self.server.gui
-        with gui.add_folder(f"Motion ({RAW_MOTION_DIR.name}/)"):
+        with gui.add_folder("Run (runs/)"):
             self.sources = list_sources()
             options = list(self.sources) or ["<none found>"]
-            self.gui_source = gui.add_dropdown("source", options,
+            self.gui_source = gui.add_dropdown("run", options,
                                                initial_value=options[0])
-            refresh = gui.add_button("refresh sources")
+            refresh = gui.add_button("refresh runs")
+            self.md_recon = gui.add_markdown("*no run loaded*")
 
             @refresh.on_click
             def _(_):
                 self.sources = list_sources()
                 opts = list(self.sources) or ["<none found>"]
                 self.gui_source.options = opts
-
-        with gui.add_folder("Scene reconstruction"):
-            self.scene_widgets = {}
-            for key, val in SCENE_DEFAULTS.items():
-                if key == "hand_geom":
-                    self.scene_widgets[key] = gui.add_dropdown(
-                        key, ("mesh", "capsule"), initial_value=val)
-                else:
-                    v = float(val)
-                    self.scene_widgets[key] = gui.add_number(
-                        key, v, min=0.0, step=0.005)
-            self.btn_recon = gui.add_button("1. Reconstruct scene")
-            self.md_recon = gui.add_markdown("*no reconstruction yet*")
 
         with gui.add_folder("SBMPC solve"):
             self.solve_widgets = {}
@@ -160,9 +155,9 @@ class Panel:
                 else:
                     self.solve_widgets[key] = gui.add_number(
                         key, float(val), min=0.0, step=0.05)
-            self.btn_solve = gui.add_button("2. Solve SBMPC")
+            self.btn_solve = gui.add_button("Solve SBMPC")
             self.btn_solve.disabled = True
-            self.md_solve = gui.add_markdown("*reconstruct first*")
+            self.md_solve = gui.add_markdown("*load a run first*")
 
         with gui.add_folder("Playback"):
             self.gui_frame = gui.add_slider("progress", 0.0, 1.0, 0.001, 0.0)
@@ -171,17 +166,13 @@ class Panel:
 
         @self.gui_source.on_update
         def _(_):
-            self._spawn(self.do_preview)
-
-        @self.btn_recon.on_click
-        def _(_):
-            self._spawn(self.do_reconstruct)
+            self._spawn(self.do_load_run)
 
         @self.btn_solve.on_click
         def _(_):
             self._spawn(self.do_solve)
 
-        self._spawn(self.do_preview)  # preview the initial selection
+        self._spawn(self.do_load_run)  # load the initial selection
 
     def _spawn(self, fn):
         if self.busy:
@@ -190,90 +181,31 @@ class Panel:
 
     def _set_busy(self, busy: bool):
         self.busy = busy
-        self.btn_recon.disabled = busy
         self.btn_solve.disabled = busy or self.task_dir is None
 
-    # --------------------------------------------------------- preview --
-    def do_preview(self):
-        """Play the raw kinematic motion (robot only) on source selection."""
-        source = self.sources.get(self.gui_source.value)
-        if source is None:
+    # -------------------------------------------------------- load run --
+    def do_load_run(self):
+        """Show the reference motion in its reconstructed scene (plus the
+        previous solution, if the run already has one)."""
+        entry = self.sources.get(self.gui_source.value)
+        if entry is None:
             return
         self._set_busy(True)
         try:
-            qpos, _ = load_kimodo_npz(source, use_smooth_pos=False)  # (T,36)
-            self.ref_qpos = None
-            self.res_qpos = None
-            self.task_dir = None  # solve needs a fresh reconstruction
-            for h in self.scene_handles + self.hand_handles:
-                h.remove()
-            self.scene_handles, self.hand_handles = [], []
-            if self.res_base is not None:
-                self.res_base.visible = False
-            if self.res_box is not None:
-                self.res_box.remove()
-                self.res_box = None
-            if self.ref_box is not None:
-                self.ref_box.remove()
-                self.ref_box = None
-            self.ref_base.visible = True
-            self.gui_frame.value = 0.0
-            self.ref_qpos = qpos  # publish LAST
-            self.md_recon.content = (f"*previewing raw motion `{source.stem}`"
-                                     " — reconstruct to add the scene*")
-            self.md_solve.content = "*reconstruct first*"
-        except Exception as e:
-            self.md_recon.content = f"**preview failed**: {e}"
-        finally:
-            self._set_busy(False)
-
-    # ----------------------------------------------------- reconstruct --
-    def do_reconstruct(self):
-        label = self.gui_source.value
-        source = self.sources.get(label)
-        if source is None:
-            return
-        self._set_busy(True)
-        self.md_recon.content = "**reconstructing ...** (takes ~10-20 s)"
-        try:
-            name = shim.sanitize(source.stem if source.is_file()
-                                 else source.name)
-            run_dir = RUNS_DIR / name
-            run_dir.mkdir(parents=True, exist_ok=True)
-            if source.is_file():
-                motion_dir = shim.shim_motion_npz(source, run_dir)
-            else:
-                motion_dir = shim.shim_example(source, run_dir)
-
-            scene_params = {k: w.value for k, w in self.scene_widgets.items()}
-            flags = []
-            for k, v in scene_params.items():
-                flags += [f"--{k.replace('_', '-')}", str(v)]
-            out_root = run_dir / "outputs"
-            proc = subprocess.run(
-                [str(CFG.mppi_python),
-                 str(CFG.mppi_locoma / "scripts/build_trial.py"),
-                 "--motion-dir", str(motion_dir), "--out-root", str(out_root),
-                 *flags],
-                cwd=str(CFG.mppi_locoma), capture_output=True, text=True)
-            result_line = next(
-                (ln for ln in proc.stdout.splitlines() if "pick f" in ln),
-                proc.stdout.strip().splitlines()[-1] if proc.stdout.strip()
-                else proc.stderr.strip().splitlines()[-1] if proc.stderr.strip()
-                else "no output")
-            task_root = out_root / TASK_SUBTREE
-            tasks = (sorted(d for d in task_root.iterdir() if d.is_dir())
-                     if task_root.is_dir() else [])
-            if proc.returncode != 0 or not tasks or "SKIPPED" in result_line:
-                self.md_recon.content = f"**failed/skipped**\n```\n{result_line}\n```"
-                self.task_dir = None
-                return
-            self.run_dir, self.task_dir = run_dir, tasks[0]
-            manifest.update(run_dir, {"name": name, "source": str(source),
-                                      "panel_scene_params": scene_params})
+            self.run_dir, self.task_dir = entry
             self._load_reference()
-            self.md_recon.content = f"```\n{result_line.split(' -> ')[0]}\n```"
+            if (self.task_dir / "0/trajectory_mjwp.npz").exists():
+                self._load_result()
+                solved = "; showing its previous solution"
+            else:
+                solved = ""
+            verdict = (manifest.read(self.run_dir) or {}).get("verdict", "?")
+            self.md_recon.content = (f"*run `{self.run_dir.name}` "
+                                     f"(verdict: {verdict}){solved}*")
             self.md_solve.content = "*ready to solve*"
+        except Exception as e:
+            self.task_dir = None
+            self.md_recon.content = f"**load failed**: {e}"
         finally:
             self._set_busy(False)
 
