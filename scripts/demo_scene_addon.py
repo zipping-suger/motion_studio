@@ -79,10 +79,9 @@ class SceneReconAddon:
                 else:
                     self.scene_widgets[key] = gui.add_number(
                         key, float(val), min=0.0, step=0.005)
-            self.gui_held = gui.add_checkbox("allow held start", False)
-            # contact window override; -1 = auto-detect. The reconstruct
-            # status line reports the window actually used — set these to
-            # correct it and re-click.
+            # contact window (the period the robot holds the object);
+            # -1 = full clip. The reconstruct status line reports the
+            # window used — set frames to correct it and re-click.
             self.gui_cstart = gui.add_number("contact start", -1, min=-1,
                                              step=1)
             self.gui_cend = gui.add_number("contact end", -1, min=-1, step=1)
@@ -133,14 +132,12 @@ class SceneReconAddon:
             flags = []
             for k, w in self.scene_widgets.items():
                 flags += [f"--{k.replace('_', '-')}", str(w.value)]
-            if self.gui_held.value:
-                # clip begins mid-hold: box spawns in the hands, no rest
-                # pose or support inferred
-                flags.append("--allow-held-start")
-            if int(self.gui_cstart.value) >= 0:
-                flags += ["--pick-frame", str(int(self.gui_cstart.value))]
-            if int(self.gui_cend.value) >= 0:
-                flags += ["--release-frame", str(int(self.gui_cend.value))]
+            # explicit window always: -1 defaults to the full clip (start
+            # at 0 implies a held start — box spawns in the hands)
+            T = int(motion.joints_pos.shape[0])
+            cs, ce = int(self.gui_cstart.value), int(self.gui_cend.value)
+            flags += ["--pick-frame", str(cs if cs >= 0 else 0),
+                      "--release-frame", str(ce if ce >= 0 else T - 1)]
             proc = subprocess.run(
                 [str(STUDIO_BIN), "recon", str(npz_path), "--name", name,
                  *flags],

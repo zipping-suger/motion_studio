@@ -116,20 +116,21 @@ central outputs, which is exactly why studio runs are kept isolated.
   scene to build. That's a verdict, not a bug.
 - **The contact window is editable**: reconstruction hinges on the pick →
   release period (it sets the box rest pose, the width, and the frames the
-  solver rewards palm contact). The panel auto-detects it on preview and
-  shows an orange **ghost box** riding the hands — the exact object
-  trajectory the window implies. Drag `contact start`/`contact end` until
-  the ghost looks right, then Reconstruct ("auto window" re-detects). In
-  the demo, `contact start`/`contact end` of -1 mean auto; set frames to
-  override. Manual `contact start` 0 implies a held start. Reconstruction
-  runs via `scripts/recon_core.py` (mppi_locoma used as a library,
-  unmodified).
-- **Clips that start mid-hold** (hands already on the box at frame 0) are
-  also SKIPPED by default — there is no rest pose to infer, so the box lands
-  where the hands already are and the spawn check kills it. Tick **"allow
-  held start"** in the demo's scene folder (CLI: `--allow-held-start`) to
-  reconstruct them as *starts-holding* scenes: the box spawns in the hands,
-  no support is built under the start. Note the LIFT verdict measures box
+  solver rewards palm contact). It **defaults to the full clip**; the
+  panel also runs detection on preview and reports its window, applied
+  with the "auto window" button. The orange **ghost box** rides the hands
+  through the current window — the exact object trajectory it implies.
+  Edit `contact start`/`contact end` until the ghost looks right, then
+  Reconstruct. In the demo, -1 means full clip; set frames to narrow.
+  `contact start` 0 implies a held start (box spawns in the hands).
+  Reconstruction runs via `scripts/recon_core.py` (mppi_locoma used as a
+  library, unmodified).
+- **Clips that start mid-hold** (hands already on the box at frame 0) build
+  as *starts-holding* scenes whenever the contact window starts at frame 0
+  — the default full-clip window covers this. The box spawns in the hands
+  and no support is built under the start. (The panel's "allow held start"
+  checkbox and CLI `--allow-held-start` additionally let the auto-detector
+  recognize held starts on its own.) Note the LIFT verdict measures box
   final-minus-initial height, so a level carry reads "no" — judge those by
   the DR columns.
 - **Retarget hyperparameters** are single-sourced in

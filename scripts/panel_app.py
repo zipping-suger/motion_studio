@@ -184,7 +184,8 @@ class Panel:
             self.md_solve = gui.add_markdown("*reconstruct first*")
 
         with gui.add_folder("Playback"):
-            self.gui_frame = gui.add_slider("progress", 0.0, 1.0, 0.001, 0.0)
+            self.gui_frame = gui.add_slider("frame", 0, 99, 1, 0)
+            self._frame_order = self.gui_frame.order
             self.gui_play = gui.add_checkbox("play", True)
             self.gui_speed = gui.add_slider("speed", 0.1, 2.0, 0.1, 1.0)
 
@@ -199,7 +200,14 @@ class Panel:
 
         @self.btn_auto.on_click
         def _(_):
-            self._spawn(self.do_preview)  # re-detect + reset the window
+            # apply the detected window (preview defaults to the full clip)
+            if self.auto_window is None or self.busy:
+                return
+            self._suppress_window_cb = True
+            self.gui_cstart.value = self.auto_window[0]
+            self.gui_cend.value = self.auto_window[1]
+            self._suppress_window_cb = False
+            self._rebuild_ghost()
 
         @self.gui_cstart.on_update
         def _(_):
@@ -220,6 +228,14 @@ class Panel:
             self._spawn(self.do_solve)
 
         self._spawn(self.do_preview)  # preview the initial selection
+
+    def _reset_frame_slider(self, T: int):
+        """Slider bounds are immutable in viser — recreate the frame slider
+        per motion so playback shows real frame numbers."""
+        old = self.gui_frame
+        self.gui_frame = self.server.gui.add_slider(
+            "frame", 0, max(T - 1, 1), 1, 0, order=self._frame_order)
+        old.remove()
 
     def _spawn(self, fn):
         if self.busy:
@@ -256,7 +272,7 @@ class Panel:
                 self.ref_box.remove()
                 self.ref_box = None
             self.ref_base.visible = True
-            self.gui_frame.value = 0.0
+            self._reset_frame_slider(len(qpos))
             self.ref_qpos = qpos  # publish LAST
 
             # detect the contact window + precompute the hand-midpoint
@@ -271,17 +287,22 @@ class Panel:
             yaw = _smooth(np.unwrap(np.arctan2(axis[:, 1], axis[:, 0])), 9)
             self._gap = np.linalg.norm(lh - rh, axis=1)
             self._mid, self._yaw = mid, yaw
+            # default window = full clip; the detected window is one
+            # "auto window" click away
             self.auto_window = (grasp.pick_frame, grasp.release_frame)
+            T = len(qpos)
             self._suppress_window_cb = True
-            self.gui_cstart.value = grasp.pick_frame
-            self.gui_cend.value = grasp.release_frame
+            self.gui_cstart.value = 0
+            self.gui_cend.value = T - 1
             self._suppress_window_cb = False
             self._rebuild_ghost()
             self.md_recon.content = (
-                f"*previewing `{source.stem}` — auto contact window "
+                f"*previewing `{source.stem}` ({T} frames) — contact window "
+                f"defaults to the full clip; detected "
                 f"f{grasp.pick_frame}–f{grasp.release_frame} "
-                f"(flags: {','.join(grasp.quality_flags) or '-'}); the "
-                "orange ghost box shows the scene the window implies*")
+                f"(flags: {','.join(grasp.quality_flags) or '-'}, apply "
+                "with 'auto window'). The orange ghost box shows the scene "
+                "the window implies*")
             self.md_solve.content = "*reconstruct first*"
         except Exception as e:
             self.md_recon.content = f"**preview failed**: {e}"
@@ -416,7 +437,7 @@ class Panel:
                            wxyz=ref_qpos[0, 39:43])
         self._box_mesh = box_mesh
         self.ref_base.visible = True
-        self.gui_frame.value = 0.0
+        self._reset_frame_slider(len(ref_qpos))
         self.ref_qpos = ref_qpos  # publish LAST: handles are complete now
 
     # ----------------------------------------------------------- solve --
@@ -528,9 +549,8 @@ class Panel:
             return
         T = len(q)
         if self.gui_play.value:
-            self.gui_frame.value = (self.gui_frame.value
-                                    + 1.0 / max(T - 1, 1)) % 1.0
-        t = min(int(self.gui_frame.value * (T - 1)), T - 1)
+            self.gui_frame.value = (int(self.gui_frame.value) + 1) % T
+        t = min(int(self.gui_frame.value), T - 1)
         try:
             self.ref_base.position = q[t, :3]
             self.ref_base.wxyz = q[t, 3:7]
