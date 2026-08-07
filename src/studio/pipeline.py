@@ -28,7 +28,9 @@ def _stream(cmd, cwd: Path, log_path: Path, env: dict | None = None,
     ones plus a heartbeat when sparse."""
     proc = subprocess.Popen(
         [str(c) for c in cmd], cwd=str(cwd),
-        env={**os.environ, **(env or {})},
+        # unbuffered child so echoed lines stream live instead of arriving
+        # in block-buffered bursts
+        env={**os.environ, "PYTHONUNBUFFERED": "1", **(env or {})},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     with open(log_path, "w") as log:

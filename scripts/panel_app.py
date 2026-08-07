@@ -165,6 +165,7 @@ class Panel:
                         key, float(val), min=0.0, step=0.05)
             self.btn_solve = gui.add_button("2. Solve SBMPC")
             self.btn_solve.disabled = True
+            self.solve_progress = gui.add_progress_bar(0.0, visible=False)
             self.md_solve = gui.add_markdown("*reconstruct first*")
 
         with gui.add_folder("Playback"):
@@ -343,6 +344,11 @@ class Panel:
         log_path = logs / f"retarget_{task}.log"
         t0 = time.time()
         self.md_solve.content = "solving ..."
+        # animated until the first receding-horizon step reports: warp
+        # kernel compilation runs first and emits no progress
+        self.solve_progress.value = 0.0
+        self.solve_progress.animated = True
+        self.solve_progress.visible = True
         try:
             proc = subprocess.Popen(
                 [str(CFG.mppi_python),
@@ -352,15 +358,27 @@ class Panel:
                  "show_viewer=false", "+wait_on_finish=false",
                  "save_video=false", "+sanity_check_seconds=0.0"],
                 cwd=str(CFG.mppi_locoma),
-                env={**os.environ, "MUJOCO_GL": "egl"},
+                # unbuffered child: progress prints must reach the pipe per
+                # line, not in one burst at exit
+                env={**os.environ, "MUJOCO_GL": "egl",
+                     "PYTHONUNBUFFERED": "1"},
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             final = ""
+            prog_re = re.compile(r"sim_steps: (\d+)/(\d+)")
             with open(log_path, "w") as log:
                 for i, line in enumerate(proc.stdout):
                     log.write(line)
                     if "Final object" in line:
                         final = line.strip().split("- ")[-1]
-                    if i % 25 == 0:
+                    m = prog_re.search(line)
+                    if m:
+                        cur, tot = int(m.group(1)), int(m.group(2))
+                        self.solve_progress.animated = False
+                        self.solve_progress.value = 100.0 * cur / max(tot, 1)
+                        self.md_solve.content = (
+                            f"solving ... {time.time() - t0:.0f}s "
+                            f"({cur}/{tot} sim steps)")
+                    elif i % 25 == 0:
                         self.md_solve.content = (
                             f"solving ... {time.time() - t0:.0f}s")
             if proc.wait() != 0:
@@ -375,6 +393,7 @@ class Panel:
             self.md_solve.content = (f"**{time.time() - t0:.0f}s** — {final}\n"
                                      f"```\n{row}\n```")
         finally:
+            self.solve_progress.visible = False
             self._set_busy(False)
 
     def _load_result(self):
