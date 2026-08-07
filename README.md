@@ -60,10 +60,12 @@ disabled until you commit a sample by clicking it). Then either:
   reconstructs, retargets, and prints the LIFT / DynaRetarget verdict.
 
 ```bash
-uv run studio panel                     # SBMPC solve panel (:8082): pick a
-                                        # reconstructed run, inspect ref
-                                        # motion in its scene, tune SBMPC
-                                        # hyperparams, click Solve, watch ref
+uv run studio panel                     # tuning panel (:8082): pick a motion
+                                        # from raw_motion/ (previews on
+                                        # select), Reconstruct with tunable
+                                        # scene params (same controls as the
+                                        # demo, incl. allow held start), tune
+                                        # SBMPC hyperparams, Solve, watch ref
                                         # vs solution; results = normal runs
 uv run studio recon <npz|example>       # scene reconstruction only, from the
                                         # CLI (--name X, extra flags pass to
