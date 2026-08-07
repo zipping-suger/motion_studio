@@ -111,6 +111,14 @@ central outputs, which is exactly why studio runs are kept isolated.
 - **Reach-only clips are SKIPPED**: scene reconstruction infers the object
   from pick/carry hand kinematics; a motion with no object interaction has no
   scene to build. That's a verdict, not a bug.
+- **Clips that start mid-hold** (hands already on the box at frame 0) are
+  also SKIPPED by default — there is no rest pose to infer, so the box lands
+  where the hands already are and the spawn check kills it. Tick **"allow
+  held start"** in the demo's scene folder (CLI: `--allow-held-start`) to
+  reconstruct them as *starts-holding* scenes: the box spawns in the hands,
+  no support is built under the start. Note the LIFT verdict measures box
+  final-minus-initial height, so a level carry reads "no" — judge those by
+  the DR columns.
 - **Retarget hyperparameters** are single-sourced in
   `mppi_locoma/config.yml` (`retarget:` section), same as its own
   `run_pipeline.sh`.

@@ -79,6 +79,7 @@ class SceneReconAddon:
                 else:
                     self.scene_widgets[key] = gui.add_number(
                         key, float(val), min=0.0, step=0.005)
+            self.gui_held = gui.add_checkbox("allow held start", False)
             self.gui_show = gui.add_checkbox("show scene", True)
             self.btn = gui.add_button("Reconstruct scene", color="teal")
             self.md = gui.add_markdown(
@@ -126,6 +127,10 @@ class SceneReconAddon:
             flags = []
             for k, w in self.scene_widgets.items():
                 flags += [f"--{k.replace('_', '-')}", str(w.value)]
+            if self.gui_held.value:
+                # clip begins mid-hold: box spawns in the hands, no rest
+                # pose or support inferred
+                flags.append("--allow-held-start")
             proc = subprocess.run(
                 [str(STUDIO_BIN), "recon", str(npz_path), "--name", name,
                  *flags],
