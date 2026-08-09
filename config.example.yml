@@ -1,0 +1,55 @@
+# kimodo_studio configuration: external paths and connection settings.
+#
+#   cp config.example.yml config.yml    # then edit the paths below
+#
+# config.yml is gitignored — it is per-machine. Values may use ~ and
+# $VARS. Set STUDIO_CONFIG to point somewhere else entirely.
+
+paths:
+  # Clone of the kimodo repo: the viser demo and the diffusion model.
+  kimodo_repo: ~/Programs/kimodo
+
+  # A SPIDER checkout (or a built .whl). Used ONLY by `studio setup`:
+  # it copies the G1 assets out and builds the solve venv from it.
+  # Nothing at run time touches this path.
+  spider: ~/Programs/spider
+
+  # Optional. The two heavy runtimes `studio setup` creates. Defaults are
+  # <this repo>/.venv-kimodo and <this repo>/.venv-solve; set these only
+  # to reuse venvs you manage elsewhere.
+  # kimodo_python: ~/venvs/kimodo/bin/python
+  # solve_python:  ~/venvs/solve/bin/python
+
+  # Optional. Default destination for `studio promote` — a central trial
+  # collection outside this repo, if you keep one.
+  # dataset_outputs: ~/datasets/kimodo/processed/kimodo/unitree_g1/humanoid_object
+
+# Optional. Scene-reconstruction defaults; omit to use the values in
+# studio.config.SCENE_DEFAULTS. All three GUIs expose these per run, so
+# only set them here to change the starting point machine-wide.
+# scene:
+#   box_mass: 0.2          # kg
+#   box_height: 0.20       # m
+#   box_depth: 0.24        # m
+#   squeeze: 0.008         # m, extra width so the reference hands press in
+#   hand_geom: mesh        # mesh (rubber-hand hull) | capsule
+#   floor_snap_below: 0.25 # m, below this the box extends down to the floor
+
+# Optional. SBMPC solve hyperparameters; omit to use the values in
+# studio.config.SOLVE_DEFAULTS. Everything else about the solve is fixed
+# task setup and lives in studio/solve/spider_cfg.py.
+# solve:
+#   num_samples: 2048      # parallel worlds; lower this if the GPU OOMs
+#   max_num_iterations: 16 # annealing iterations per control tick
+#   pos_rew_scale: 8.0     # object position — the objective
+#   joint_rew_scale: 0.5   # robot pose — a guide only
+
+demo:
+  model: Kimodo-G1-RP-v1
+  port: 7860
+
+encoder:
+  # SSH alias of the cluster login node (as in ~/.ssh/config);
+  # `studio tunnel <node>` jumps through it to the compute node.
+  remote_host: euler
+  port: 9550

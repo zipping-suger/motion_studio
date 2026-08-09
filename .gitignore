@@ -1,6 +1,15 @@
+# per-machine config (copy config.example.yml)
+config.yml
+
+# working dirs: pipeline outputs, authored clips, cached embeddings
 runs/
-offline_cache/
 raw_motion/
+offline_cache/
+
+# G1 meshes + URDF: Unitree-licensed binaries, fetched by `studio setup`
+assets/g1/
+
 .venv*/
 __pycache__/
 *.pyc
+.pytest_cache/
