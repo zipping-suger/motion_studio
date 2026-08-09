@@ -2,19 +2,18 @@
 
 Pick a motion from raw_motion/ (where the demo's local motion saves
 land) — it previews immediately — then click "1. Reconstruct scene"
-(mppi_locoma build_trial with the scene params set in the GUI, same
-controls as the demo's "Scene recon (mppi)" folder, including allow held
-start), inspect the reconstruction, tune SBMPC hyperparameters, click
-"2. Solve SBMPC" (run_mjwp), and watch reference (transparent) vs
-solution (solid) playback. Every action works inside an ordinary studio
-run dir (runs/<name>/), so list/view/promote all apply.
+(studio.recon with the scene params set in the GUI, same controls as the
+demo's "Scene recon" folder, including allow held start), inspect the
+reconstruction, tune SBMPC hyperparameters, click "2. Solve SBMPC"
+(studio.solve), and watch reference (transparent) vs solution (solid)
+playback. Every action works inside an ordinary studio run dir
+(runs/<name>/), so list/view/promote all apply.
 
-Runs in mppi_locoma's venv (viser + mujoco): launch with `studio panel`.
-Visualization conventions mirror mppi_locoma/scripts/view_trial.py.
+Runs in the solve venv, which has viser + mujoco + SPIDER: launch with
+`studio panel`, or `studio view <run>` to open an existing run.
 """
 
 import argparse
-import json
 import os
 import re
 import subprocess
@@ -25,32 +24,29 @@ from pathlib import Path
 
 import numpy as np
 import trimesh
-import yaml
 
 STUDIO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(STUDIO_ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling scripts
 
-from studio import manifest, shim
-from studio.config import RUNS_DIR, TASK_SUBTREE, load_config
-
-CFG = load_config()
-sys.path.insert(0, str(CFG.mppi_locoma / "src"))
+from studio import manifest, recon, shim, solve, viz
+from studio.config import (RAW_MOTION_DIR, RUNS_DIR, SCENE_DEFAULTS,
+                           SOLVE_DEFAULTS, SOLVE_INT_KEYS, load_config,
+                           task_dirs)
+from studio.recon.grasp import (BOX_WIDTH_MAX, BOX_WIDTH_MIN,
+                                HAND_SURFACE_OFFSET, detect_grasp)
+from studio.recon.loader import (DOF_NAMES, KIM_LEFT_HAND_TIP,
+                                 KIM_RIGHT_HAND_TIP, load_kimodo_npz)
+from studio.recon.signal import smooth
 
 import mujoco
-import spider
 import viser
 from viser.extras import ViserUrdf
 import yourdfpy
 
-import recon_core
-from grasp_detect import (HAND_SURFACE_OFFSET, BOX_WIDTH_MIN, BOX_WIDTH_MAX,
-                          _smooth, detect_grasp)
-from kimodo_loader import (DOF_NAMES, KIM_LEFT_HAND_TIP, KIM_RIGHT_HAND_TIP,
-                           load_kimodo_npz)
-from repo_config import G1_URDF, RETARGET_PARAMS, SCENE_DEFAULTS
-
-MESHES_DIR = str(Path(spider.ROOT) / "assets/robots/unitree_g1/meshes")
-INT_KEYS = {"num_samples", "max_num_iterations"}
+CFG = load_config()
+G1_URDF = str(recon.assets.G1_URDF)
+MESHES_DIR = str(recon.assets.MESHES_DIR)
 
 
 def hand_collision_geoms(scene_xml, qpos_traj):
@@ -83,9 +79,6 @@ def hand_collision_geoms(scene_xml, qpos_traj):
             mujoco.mju_mat2Quat(quat, d.geom_xmat[gid].ravel())
             poses[t, k, 3:] = quat
     return meshes, poses
-
-
-RAW_MOTION_DIR = STUDIO_ROOT / "raw_motion"
 
 
 def list_sources():
@@ -152,14 +145,7 @@ class Panel:
 
         # same controls as the demo's "Scene recon (mppi)" folder
         with gui.add_folder("Scene reconstruction"):
-            self.scene_widgets = {}
-            for key, val in SCENE_DEFAULTS.items():
-                if key == "hand_geom":
-                    self.scene_widgets[key] = gui.add_dropdown(
-                        key, ("mesh", "capsule"), initial_value=val)
-                else:
-                    self.scene_widgets[key] = gui.add_number(
-                        key, float(val), min=0.0, step=0.005)
+            self.scene_widgets = viz.scene_param_widgets(gui, SCENE_DEFAULTS)
             self.gui_held = gui.add_checkbox("allow held start", False)
             # contact window: auto-detected on preview, freely editable;
             # the ghost box shows the object trajectory it implies
@@ -171,8 +157,8 @@ class Panel:
 
         with gui.add_folder("SBMPC solve"):
             self.solve_widgets = {}
-            for key, val in RETARGET_PARAMS.items():
-                if key in INT_KEYS:
+            for key, val in SOLVE_DEFAULTS.items():
+                if key in SOLVE_INT_KEYS:
                     self.solve_widgets[key] = gui.add_number(
                         key, int(val), min=1, step=max(1, int(val) // 16))
                 else:
@@ -282,9 +268,9 @@ class Panel:
             jp = meta["joint_positions"]
             lh, rh = jp[:, KIM_LEFT_HAND_TIP], jp[:, KIM_RIGHT_HAND_TIP]
             mid = 0.5 * (lh + rh)
-            mid = np.stack([_smooth(mid[:, i], 5) for i in range(3)], axis=1)
+            mid = np.stack([smooth(mid[:, i], 5) for i in range(3)], axis=1)
             axis = lh - rh
-            yaw = _smooth(np.unwrap(np.arctan2(axis[:, 1], axis[:, 0])), 9)
+            yaw = smooth(np.unwrap(np.arctan2(axis[:, 1], axis[:, 0])), 9)
             self._gap = np.linalg.norm(lh - rh, axis=1)
             self._mid, self._yaw = mid, yaw
             # default window = full clip; the detected window is one
@@ -364,7 +350,7 @@ class Panel:
             if override:
                 scene_params["contact_window"] = [pick, rel]
             try:
-                task_dir, _, line = recon_core.reconstruct(
+                task_dir, _, line = recon.reconstruct(
                     npz, run_dir / "outputs", f"{name}_00",
                     {k: v for k, v in scene_params.items()
                      if k in SCENE_DEFAULTS},
@@ -390,7 +376,7 @@ class Panel:
 
     def _load_reference(self):
         self._clear_ghost()  # the real reconstructed box replaces it
-        info = json.loads((self.task_dir / "task_info.json").read_text())
+        info = viz.read_info(self.task_dir)
         ref_qpos = np.load(
             self.task_dir / "0/trajectory_kinematic.npz")["qpos"]
         # unpublish first: tick() runs concurrently in the main thread and
@@ -406,36 +392,15 @@ class Panel:
             self.res_box.remove()
             self.res_box = None
 
-        add = self.server.scene.add_mesh_simple
-        if info.get("has_table"):
-            xml = (self.task_dir / "scene.xml").read_text()
-            m = re.search(r'<geom name="table"[^>]*size="([^"]+)"[^>]*'
-                          r'pos="([^"]+)"(?:[^>]*quat="([^"]+)")?', xml)
-            if m:
-                size = np.fromstring(m.group(1), sep=" ") * 2
-                mesh = trimesh.creation.box(size)
-                self.scene_handles.append(add(
-                    "/scene/table", mesh.vertices, mesh.faces,
-                    color=(140, 100, 60),
-                    position=np.fromstring(m.group(2), sep=" "),
-                    wxyz=(np.fromstring(m.group(3), sep=" ") if m.group(3)
-                          else np.array([1.0, 0, 0, 0]))))
-        for i, g in enumerate(info.get("terrain_geoms", [])):
-            mesh = trimesh.creation.box(np.array(g["half"]) * 2)
-            yaw = g.get("yaw", 0.0)
-            self.scene_handles.append(add(
-                f"/scene/terrain_{i}", mesh.vertices, mesh.faces,
-                color=(150, 140, 120), position=np.array(g["center"]),
-                wxyz=np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)])))
+        self.scene_handles = viz.add_scene(self.server, self.task_dir)
 
         if self.ref_box is not None:
             self.ref_box.remove()
-        box_mesh = trimesh.creation.box(info["box_size"])
-        self.ref_box = add("/ref_box", box_mesh.vertices, box_mesh.faces,
-                           color=(200, 60, 60), opacity=0.4,
-                           position=ref_qpos[0, 36:39],
-                           wxyz=ref_qpos[0, 39:43])
-        self._box_mesh = box_mesh
+        self._box_mesh = viz.box_mesh(info)
+        self.ref_box = self.server.scene.add_mesh_simple(
+            "/ref_box", self._box_mesh.vertices, self._box_mesh.faces,
+            color=(200, 60, 60), opacity=0.4,
+            position=ref_qpos[0, 36:39], wxyz=ref_qpos[0, 39:43])
         self.ref_base.visible = True
         self._reset_frame_slider(len(ref_qpos))
         self.ref_qpos = ref_qpos  # publish LAST: handles are complete now
@@ -447,11 +412,9 @@ class Panel:
         self._set_busy(True)
         task = self.task_dir.name
         params = {k: w.value for k, w in self.solve_widgets.items()}
-        overrides = [f"{k}={int(v) if k in INT_KEYS else float(v)}"
-                     for k, v in params.items()]
         logs = self.run_dir / "logs"
         logs.mkdir(exist_ok=True)
-        log_path = logs / f"retarget_{task}.log"
+        log_path = logs / f"solve_{task}.log"
         t0 = time.time()
         self.md_solve.content = "solving ..."
         # animated until the first receding-horizon step reports: warp
@@ -461,17 +424,10 @@ class Panel:
         self.solve_progress.visible = True
         try:
             proc = subprocess.Popen(
-                [str(CFG.mppi_python),
-                 str(CFG.mppi_locoma / "retarget/run_mjwp.py"),
-                 "+override=kimodo_pick", f"task={task}",
-                 f"dataset_dir={self.run_dir / 'outputs'}", *overrides,
-                 "show_viewer=false", "+wait_on_finish=false",
-                 "save_video=false", "+sanity_check_seconds=0.0"],
-                cwd=str(CFG.mppi_locoma),
+                solve.command(CFG, task, self.run_dir / "outputs", params),
                 # unbuffered child: progress prints must reach the pipe per
                 # line, not in one burst at exit
-                env={**os.environ, "MUJOCO_GL": "egl",
-                     "PYTHONUNBUFFERED": "1"},
+                env={**os.environ, **solve.env(), "PYTHONUNBUFFERED": "1"},
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             final = ""
             prog_re = re.compile(r"sim_steps: (\d+)/(\d+)")
@@ -495,10 +451,11 @@ class Panel:
                 self.md_solve.content = f"**solve failed** — see {log_path}"
                 return
             self._load_result()
-            row = self._eval(task)
+            metrics = solve.evaluate.evaluate_task(self.task_dir)
+            row = solve.evaluate.format_row(task, metrics)
             manifest.update(self.run_dir, {
-                "panel_retarget_params": params,
-                "verdict": "LIFT" if " YES" in row else "failed",
+                "solve_params": params,
+                "verdict": solve.evaluate.verdict([(task, metrics)]),
                 "eval_rows": [row]})
             self.md_solve.content = (f"**{time.time() - t0:.0f}s** — {final}\n"
                                      f"```\n{row}\n```")
@@ -531,15 +488,25 @@ class Panel:
         self.hand_handles, self.hand_poses = hand_handles, hand_poses
         self.res_qpos = res_qpos  # publish LAST: handles are complete now
 
-    def _eval(self, task):
-        out = subprocess.run(
-            [str(CFG.mppi_python),
-             str(CFG.mppi_locoma / "scripts/eval_trials.py"),
-             "--root", str(self.run_dir / "outputs" / TASK_SUBTREE),
-             "--filter", task],
-            cwd=str(CFG.mppi_locoma), capture_output=True, text=True).stdout
-        return next((ln for ln in out.splitlines() if ln.startswith(task)),
-                    out.strip())
+    # ------------------------------------------------------ open a run --
+    def open_run(self, name: str):
+        """Load an already-solved run: reference, scene, and result if the
+        solve has been done. This is what `studio view <name>` opens."""
+        run_dir = RUNS_DIR / name
+        tasks = task_dirs(run_dir)
+        if not tasks:
+            self.md_recon.content = f"**no built trial under** `{run_dir}`"
+            return
+        self.run_dir, self.task_dir = run_dir, tasks[0]
+        self._load_reference()
+        metrics = solve.evaluate.evaluate_task(self.task_dir)
+        if metrics is None:
+            self.md_solve.content = "*not solved yet — ready to solve*"
+        else:
+            self._load_result()
+            self.md_solve.content = (
+                f"```\n{solve.evaluate.format_row(tasks[0].name, metrics)}\n```")
+        self.md_recon.content = f"*opened run* `{name}` ({tasks[0].name})"
 
     # -------------------------------------------------------- playback --
     def tick(self):
@@ -589,9 +556,13 @@ class Panel:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8082)
+    ap.add_argument("--run", default=None,
+                    help="open an existing run instead of a raw clip")
     args = ap.parse_args()
     server = viser.ViserServer(port=args.port)
     panel = Panel(server)
+    if args.run:
+        panel._spawn(lambda: panel.open_run(args.run))
     print(f"panel at http://localhost:{args.port}", flush=True)
     import traceback
     while True:

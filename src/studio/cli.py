@@ -1,5 +1,6 @@
-"""kimodo_studio CLI — author a clip in Kimodo's viser demo, get a
-dynamically feasible G1+object trajectory out of mppi_locoma."""
+"""kimodo_studio CLI — author a clip in Kimodo's viser demo, reconstruct
+the scene it implies, and solve for a dynamically feasible G1+object
+trajectory."""
 
 import argparse
 import os
@@ -11,8 +12,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from . import manifest, pipeline
-from .config import REPO_ROOT, RUNS_DIR, TASK_SUBTREE, Config, load_config
+from . import manifest, pipeline, recon, solve
+from .config import (REPO_ROOT, RUNS_DIR, SCENE_DEFAULTS, SOLVE_DEFAULTS,
+                     SOLVE_INT_KEYS, Config, load_config, task_dirs)
 from .watch import watch_examples
 
 
@@ -22,7 +24,26 @@ def _run(cmd, env=None) -> None:
                    env={**os.environ, **(env or {})})
 
 
-def cmd_setup(cfg: Config, args) -> int:
+def _spider(cfg: Config, explicit: str | None) -> Path:
+    """A SPIDER checkout (or wheel). Needed only at setup: the G1 assets
+    are Unitree-licensed and SPIDER is CC-BY-NC, so this repo redistributes
+    neither — it copies what it needs from your install."""
+    for candidate in (explicit, os.environ.get("SPIDER_ROOT"), cfg.spider):
+        if candidate:
+            return Path(candidate).expanduser()
+    raise SystemExit(
+        "no SPIDER install configured. Set paths.spider in config.yml, or:\n"
+        "  studio setup --spider <checkout or .whl>")
+
+
+def _setup_assets(cfg: Config, spider: Path) -> None:
+    print("== G1 assets ==")
+    n = recon.assets.install(spider)
+    print(f"installed {n} file(s) into {recon.assets.G1_DIR}")
+
+
+def _setup_kimodo(cfg: Config) -> None:
+    print("\n== kimodo venv (the demo runtime) ==")
     venv = cfg.kimodo_python.parent.parent
     if not cfg.kimodo_python.exists():
         _run(["uv", "venv", "--python", "3.11", venv])
@@ -37,6 +58,39 @@ def cmd_setup(cfg: Config, args) -> int:
         _run(pip + ["-e", local_viser])
     else:
         _run(pip + ["viser @ git+https://github.com/nv-tlabs/kimodo-viser.git"])
+
+
+def _setup_solve(cfg: Config, spider: Path) -> None:
+    """The solve runtime: SPIDER pins its own torch, warp and mujoco-warp,
+    which is exactly why it gets its own venv instead of studio's."""
+    print("\n== solve venv (torch + warp + SPIDER) ==")
+    venv = cfg.solve_python.parent.parent
+    if not cfg.solve_python.exists():
+        # SPIDER requires >= 3.12
+        _run(["uv", "venv", "--python", "3.12", venv])
+    _run(["uv", "pip", "install", "--python", cfg.solve_python,
+          # warp-lang / mujoco-warp are served from NVIDIA's index; uv
+          # sources are not transitive, so the index is named again here
+          "--extra-index-url", "https://pypi.nvidia.com/",
+          "--index-strategy", "unsafe-best-match",
+          str(spider),
+          # the panel draws URDF + convex hulls on top of the solve venv
+          "trimesh", "yourdfpy"])
+
+
+def cmd_setup(cfg: Config, args) -> int:
+    stages = [s for s in ("assets", "kimodo", "solve") if getattr(args, s)]
+    stages = stages or ["assets", "kimodo", "solve"]
+    spider = _spider(cfg, args.spider) if {"assets", "solve"} & set(stages) \
+        else None
+
+    if "assets" in stages:
+        _setup_assets(cfg, spider)
+    if "kimodo" in stages:
+        _setup_kimodo(cfg)
+    if "solve" in stages:
+        _setup_solve(cfg, spider)
+
     print("\nsetup done. Notes:\n"
           f"- first `studio demo` downloads {cfg.model} from HuggingFace and\n"
           "  builds the viser web client (downloads Node 20; a few minutes)\n"
@@ -157,6 +211,21 @@ def cmd_run(cfg: Config, args) -> int:
     return 0 if pipeline.process_example(cfg, example) else 1
 
 
+def _recon_options(args) -> dict:
+    """CLI flags -> recon.reconstruct kwargs, carrying only what was set
+    so unspecified params keep their SCENE_DEFAULTS values."""
+    scene_params = {k: getattr(args, k) for k in SCENE_DEFAULTS
+                    if getattr(args, k, None) is not None}
+    options = {"allow_held_start": args.allow_held_start}
+    if scene_params:
+        options["scene_params"] = scene_params
+    if args.pick_frame is not None:
+        options["pick"] = args.pick_frame
+    if args.release_frame is not None:
+        options["release"] = args.release_frame
+    return options
+
+
 def cmd_recon(cfg: Config, args) -> int:
     src = Path(args.source)
     if not (src.is_file() and src.suffix == ".npz"):
@@ -166,9 +235,8 @@ def cmd_recon(cfg: Config, args) -> int:
                   f"(also tried under {cfg.examples_dir})", file=sys.stderr)
             return 1
         src = resolved
-    flags = [f for f in args.build_flags if f != "--"]
     run_dir = pipeline.recon_example(cfg, src.resolve(), name=args.name,
-                                     scene_flags=flags)
+                                     options=_recon_options(args))
     return 0 if run_dir is not None else 1
 
 
@@ -177,30 +245,37 @@ def cmd_watch(cfg: Config, args) -> int:
     return 0
 
 
-def _run_tasks(run_dir: Path):
-    task_root = run_dir / "outputs" / TASK_SUBTREE
-    return task_root, (sorted(d for d in task_root.iterdir() if d.is_dir())
-                       if task_root.is_dir() else [])
-
-
 def cmd_panel(cfg: Config, args) -> int:
-    cmd = [str(cfg.mppi_python), str(REPO_ROOT / "scripts/panel_app.py"),
+    solve.require(cfg)
+    cmd = [str(cfg.solve_python), str(REPO_ROOT / "scripts/panel_app.py"),
            "--port", str(args.port)]
+    if getattr(args, "name", None):
+        cmd += ["--run", args.name]
     print("+ " + " ".join(cmd), flush=True)
-    os.execv(cmd[0], cmd)
+    os.execve(cmd[0], cmd, {**os.environ, **solve.env()})
+
+
+def cmd_solve(cfg: Config, args) -> int:
+    run_dir = RUNS_DIR / args.name
+    tasks = task_dirs(run_dir)
+    if not tasks:
+        print(f"no built trial under {run_dir} — reconstruct it first "
+              f"(studio recon ...)", file=sys.stderr)
+        return 1
+    params = {k: getattr(args, k) for k in SOLVE_DEFAULTS
+              if getattr(args, k, None) is not None}
+    return 0 if pipeline.solve_tasks(cfg, run_dir, tasks, params) else 1
 
 
 def cmd_view(cfg: Config, args) -> int:
+    """Reference vs. result. The solve panel already draws exactly this,
+    so `view` opens it on an existing run rather than shipping a second
+    viewer."""
     run_dir = RUNS_DIR / args.name
-    task_root, tasks = _run_tasks(run_dir)
-    if not tasks:
+    if not task_dirs(run_dir):
         print(f"no built trial under {run_dir}", file=sys.stderr)
         return 1
-    cmd = [str(cfg.mppi_python),
-           str(cfg.mppi_locoma / "scripts/view_trial.py"), tasks[0].name,
-           "--root", str(task_root), "--port", str(args.port)]
-    print("+ " + " ".join(cmd), flush=True)
-    os.execv(cmd[0], cmd)
+    return cmd_panel(cfg, args)
 
 
 def cmd_list(cfg: Config, args) -> int:
@@ -227,11 +302,16 @@ def cmd_list(cfg: Config, args) -> int:
 
 def cmd_promote(cfg: Config, args) -> int:
     run_dir = RUNS_DIR / args.name
-    _, tasks = _run_tasks(run_dir)
+    tasks = task_dirs(run_dir)
     if not tasks:
         print(f"no built trial under {run_dir}", file=sys.stderr)
         return 1
-    central = cfg.mppi_locoma / "outputs" / TASK_SUBTREE
+    central = Path(args.to) if args.to else cfg.dataset_outputs
+    if central is None:
+        print("no destination: pass --to <dir>, or set paths.dataset_outputs "
+              "in config.yml", file=sys.stderr)
+        return 1
+    central.mkdir(parents=True, exist_ok=True)
     clashes = [t.name for t in tasks if (central / t.name).exists()]
     if clashes:
         print(f"refusing to overwrite existing central task(s): {clashes}",
@@ -240,18 +320,25 @@ def cmd_promote(cfg: Config, args) -> int:
     for t in tasks:
         shutil.copytree(t, central / t.name)
         print(f"promoted {t.name} -> {central / t.name}")
-    print("now visible to mppi_locoma's eval_trials.py / export_dataset.py")
     return 0
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
         prog="studio",
-        description="Kimodo viser demo -> mppi_locoma feasibility pipeline")
+        description="Kimodo viser demo -> scene recon -> SBMPC feasibility")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("setup", help="create the kimodo venv").set_defaults(
-        func=cmd_setup)
+    p = sub.add_parser("setup", help="G1 assets + the kimodo and solve venvs "
+                                     "(all three unless a stage is named)")
+    p.add_argument("--assets", action="store_true", help="G1 meshes + URDF")
+    p.add_argument("--kimodo", action="store_true", help="the demo runtime")
+    p.add_argument("--solve", action="store_true",
+                   help="the solve runtime: torch + warp + SPIDER")
+    p.add_argument("--spider", default=None,
+                   help="SPIDER checkout or .whl (default: paths.spider in "
+                        "config.yml, or $SPIDER_ROOT)")
+    p.set_defaults(func=cmd_setup)
     p = sub.add_parser("tunnel", help="SSH tunnel to the remote text encoder")
     p.add_argument("node", nargs="?", default=None,
                    help="compute node (jumps via the login host); omit to "
@@ -271,32 +358,53 @@ def main() -> None:
     p.set_defaults(func=cmd_run)
     p = sub.add_parser(
         "recon", help="scene reconstruction only (no solve): shim into "
-                      "runs/<name>/ + build_trial; reuses the run dir so "
+                      "runs/<name>/ + reconstruct; reuses the run dir so "
                       "scene params can be iterated")
     p.add_argument("source", help="motion .npz / example dir")
     p.add_argument("--name", default=None,
                    help="run name (default: derived from the source)")
-    # unrecognized flags (e.g. --box-mass 0.5) pass through to build_trial.py
-    p.set_defaults(func=cmd_recon, passthrough=True)
+    for key, val in SCENE_DEFAULTS.items():
+        flag = "--" + key.replace("_", "-")
+        if isinstance(val, str):
+            p.add_argument(flag, choices=("capsule", "mesh"), default=None,
+                           help=f"scene param (default: {val})")
+        else:
+            p.add_argument(flag, type=float, default=None,
+                           help=f"scene param (default: {val})")
+    p.add_argument("--allow-held-start", action="store_true",
+                   help="let the detector accept a clip that begins mid-hold")
+    p.add_argument("--pick-frame", type=int, default=None,
+                   help="force the contact window start")
+    p.add_argument("--release-frame", type=int, default=None,
+                   help="force the contact window end")
+    p.set_defaults(func=cmd_recon)
+    p = sub.add_parser("solve", help="SBMPC solve for an already "
+                                     "reconstructed run")
+    p.add_argument("name", help="run name (see `studio list`)")
+    for key, val in SOLVE_DEFAULTS.items():
+        p.add_argument("--" + key.replace("_", "-"),
+                       type=int if key in SOLVE_INT_KEYS else float,
+                       default=None, help=f"solve param (default: {val})")
+    p.set_defaults(func=cmd_solve)
     p = sub.add_parser("panel", help="interactive viser panel: reconstruct + "
                                      "solve with tunable hyperparams")
     p.add_argument("--port", type=int, default=8082)
+    p.add_argument("--run", dest="name", default=None,
+                   help="open on an existing run instead of a raw clip")
     p.set_defaults(func=cmd_panel)
-    p = sub.add_parser("view", help="viser view of reference vs. result")
+    p = sub.add_parser("view", help="reference vs. result (opens the panel "
+                                    "on that run)")
     p.add_argument("name", help="run name (see `studio list`)")
-    p.add_argument("--port", type=int, default=8081)
+    p.add_argument("--port", type=int, default=8082)
     p.set_defaults(func=cmd_view)
     sub.add_parser("list", help="list runs and verdicts").set_defaults(
         func=cmd_list)
     p = sub.add_parser("promote",
-                       help="copy a run's trial(s) into mppi_locoma's "
-                            "central outputs (paper dataset flow)")
+                       help="copy a run's trial(s) into a central dataset dir")
     p.add_argument("name")
+    p.add_argument("--to", default=None,
+                   help="destination (default: paths.dataset_outputs)")
     p.set_defaults(func=cmd_promote)
 
-    args, extra = ap.parse_known_args()
-    if getattr(args, "passthrough", False):
-        args.build_flags = [f for f in extra if f != "--"]
-    elif extra:
-        ap.error(f"unrecognized arguments: {' '.join(extra)}")
+    args = ap.parse_args()
     sys.exit(args.func(load_config(), args))

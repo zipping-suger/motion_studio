@@ -15,8 +15,8 @@ child poses stay in z-up scene coordinates.
 """
 
 import argparse
-import json
-import re
+import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -24,13 +24,14 @@ import time
 from pathlib import Path
 
 import numpy as np
-import trimesh
 import viser
 
 STUDIO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(STUDIO_ROOT / "src"))
 
-from studio.config import RUNS_DIR, TASK_SUBTREE, load_config
+from studio import viz
+from studio.config import (RAW_MOTION_DIR, RUNS_DIR, SCENE_DEFAULTS,
+                           load_config, task_dirs)
 from studio.shim import sanitize
 
 from kimodo.demo.app import Demo
@@ -38,20 +39,21 @@ from kimodo.exports.motion_io import save_kimodo_npz
 from kimodo.model.registry import resolve_model_name
 
 CFG = load_config()
-RAW_MOTION_DIR = STUDIO_ROOT / "raw_motion"
-STUDIO_BIN = STUDIO_ROOT / ".venv/bin/studio"
 # kim = R @ mj with mj = [kim_z, kim_x, kim_y]: -120deg about (1,1,1)/sqrt(3)
 ZUP_TO_YUP_WXYZ = (0.5, -0.5, -0.5, -0.5)
 
 
-def scene_defaults() -> dict:
-    code = ("import sys, json; sys.path.insert(0, sys.argv[1]); "
-            "from repo_config import SCENE_DEFAULTS; "
-            "print(json.dumps(SCENE_DEFAULTS))")
-    out = subprocess.run(
-        [str(CFG.mppi_python), "-c", code, str(CFG.mppi_locoma / "src")],
-        capture_output=True, text=True, check=True)
-    return json.loads(out.stdout)
+def studio_bin() -> str:
+    """Locate the `studio` CLI. This add-on runs in the kimodo venv, which
+    has no MuJoCo, so reconstruction goes back out through studio's venv."""
+    found = os.environ.get("STUDIO_BIN") or shutil.which("studio")
+    if found:
+        return found
+    local = STUDIO_ROOT / ".venv/bin/studio"
+    if local.exists():
+        return str(local)
+    raise RuntimeError("cannot find the `studio` CLI — run `uv sync`, or "
+                       "point STUDIO_BIN at it")
 
 
 class SceneReconAddon:
@@ -71,14 +73,7 @@ class SceneReconAddon:
         gui = self.server.gui
         with gui.add_folder("Scene recon (mppi)"):
             self.gui_name = gui.add_text("run name", initial_value="clip")
-            self.scene_widgets = {}
-            for key, val in scene_defaults().items():
-                if key == "hand_geom":
-                    self.scene_widgets[key] = gui.add_dropdown(
-                        key, ("mesh", "capsule"), initial_value=val)
-                else:
-                    self.scene_widgets[key] = gui.add_number(
-                        key, float(val), min=0.0, step=0.005)
+            self.scene_widgets = viz.scene_param_widgets(gui, SCENE_DEFAULTS)
             # contact window (the period the robot holds the object);
             # -1 = full clip. The reconstruct status line reports the
             # window used — set frames to correct it and re-click.
@@ -139,16 +134,12 @@ class SceneReconAddon:
             flags += ["--pick-frame", str(cs if cs >= 0 else 0),
                       "--release-frame", str(ce if ce >= 0 else T - 1)]
             proc = subprocess.run(
-                [str(STUDIO_BIN), "recon", str(npz_path), "--name", name,
+                [studio_bin(), "recon", str(npz_path), "--name", name,
                  *flags],
                 capture_output=True, text=True)
             pick_line = next(
                 (ln for ln in proc.stdout.splitlines() if "pick f" in ln), "")
-            run_dir = RUNS_DIR / name
-            task_root = run_dir / "outputs" / TASK_SUBTREE
-            tasks = (sorted(d for d in task_root.iterdir() if d.is_dir()
-                            and d.name.startswith(name))
-                     if task_root.is_dir() else [])
+            tasks = task_dirs(RUNS_DIR / name, prefix=name)
             if proc.returncode != 0 or not tasks:
                 tail = (pick_line or proc.stdout.strip().splitlines()[-1:]
                         or proc.stderr.strip().splitlines()[-1:] or ["?"])
@@ -166,7 +157,7 @@ class SceneReconAddon:
             self.btn.disabled = False
 
     def _load_overlay(self, task_dir: Path, client_id: int):
-        info = json.loads((task_dir / "task_info.json").read_text())
+        info = viz.read_info(task_dir)
         ref_qpos = np.load(task_dir / "0/trajectory_kinematic.npz")["qpos"]
         box_traj = ref_qpos[:, 36:43].copy()
 
@@ -176,31 +167,11 @@ class SceneReconAddon:
                 h.remove()
         self.static_handles, self.box_handle = [], None
 
-        add = self.server.scene.add_mesh_simple
-        if info.get("has_table"):
-            m = re.search(r'<geom name="table"[^>]*size="([^"]+)"[^>]*'
-                          r'pos="([^"]+)"(?:[^>]*quat="([^"]+)")?',
-                          (task_dir / "scene.xml").read_text())
-            if m:
-                mesh = trimesh.creation.box(
-                    np.fromstring(m.group(1), sep=" ") * 2)
-                self.static_handles.append(add(
-                    "/mppi_recon/table", mesh.vertices, mesh.faces,
-                    color=(140, 100, 60), opacity=0.8,
-                    position=np.fromstring(m.group(2), sep=" "),
-                    wxyz=(np.fromstring(m.group(3), sep=" ") if m.group(3)
-                          else np.array([1.0, 0, 0, 0]))))
-        for i, g in enumerate(info.get("terrain_geoms", [])):
-            mesh = trimesh.creation.box(np.array(g["half"]) * 2)
-            yaw = g.get("yaw", 0.0)
-            self.static_handles.append(add(
-                f"/mppi_recon/terrain_{i}", mesh.vertices, mesh.faces,
-                color=(150, 140, 120), opacity=0.8,
-                position=np.array(g["center"]),
-                wxyz=np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)])))
-        box_mesh = trimesh.creation.box(info["box_size"])
-        self.box_handle = add(
-            "/mppi_recon/box", box_mesh.vertices, box_mesh.faces,
+        self.static_handles = viz.add_scene(
+            self.server, task_dir, prefix="/mppi_recon", opacity=0.8)
+        mesh = viz.box_mesh(info)
+        self.box_handle = self.server.scene.add_mesh_simple(
+            "/mppi_recon/box", mesh.vertices, mesh.faces,
             color=(200, 60, 60), opacity=0.6,
             position=box_traj[0, :3], wxyz=box_traj[0, 3:])
         self.state = {"box": box_traj, "sid": client_id}  # publish LAST

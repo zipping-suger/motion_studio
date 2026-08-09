@@ -1,5 +1,6 @@
 """Load config.yml and derive the paths every command needs."""
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -7,25 +8,85 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNS_DIR = REPO_ROOT / "runs"
+RAW_MOTION_DIR = REPO_ROOT / "raw_motion"
+EXAMPLE_CONFIG = REPO_ROOT / "config.example.yml"
 
-# mppi_locoma's trial subtree (mirrors its repo_config.TASKS_DIR layout);
-# trials of run <name> live at <run>/outputs/<TASK_SUBTREE>/<task>/.
+# where `studio setup` puts the two heavy runtimes unless config.yml
+# overrides them. Each is a third-party stack with its own pinned torch, so
+# they stay out of studio's own venv.
+DEFAULT_KIMODO_PYTHON = REPO_ROOT / ".venv-kimodo/bin/python"
+DEFAULT_SOLVE_PYTHON = REPO_ROOT / ".venv-solve/bin/python"
+
+# SPIDER's trial layout (spider.io.get_processed_data_dir); trials of run
+# <name> live at <run>/outputs/<TASK_SUBTREE>/<task>/. The solve resolves
+# the same path from dataset_dir, so this must stay in step with it.
 TASK_SUBTREE = Path("processed/kimodo/unitree_g1/humanoid_object")
+
+# Scene-reconstruction parameters, as all three GUIs expose them.
+# They live here, not in studio.recon, because the demo add-on runs in the
+# kimodo venv — which has no MuJoCo and so cannot import that package.
+# Overridable per-machine from config.yml's optional `scene:` section, and
+# per-run from the panel, the demo add-on, and `studio recon` flags.
+SCENE_DEFAULTS = {
+    "box_mass": 0.2,        # kg
+    "box_height": 0.20,     # m
+    "box_depth": 0.24,      # m
+    "squeeze": 0.008,       # m, extra box width so reference hands press in
+    "hand_geom": "mesh",    # mesh (rubber-hand convex hull) | capsule
+    # if the inferred support surface is below this height, extend the box
+    # down to rest on the floor (no slab) with palms gripping at its centroid
+    "floor_snap_below": 0.25,
+}
+
+# SBMPC solve hyperparameters, as the panel exposes them. Object interaction
+# is the objective; robot tracking only guides. Everything else about the
+# solve is fixed task setup and lives in studio.solve.spider_cfg.
+# Overridable from config.yml's optional `solve:` section.
+SOLVE_DEFAULTS = {
+    "num_samples": 2048,        # parallel mujoco_warp worlds (VRAM-bound)
+    "horizon": 1.0,             # s, planning horizon
+    "max_num_iterations": 16,   # annealing iterations per control tick
+    "temperature": 1.0,         # softmax temperature over the top 10%
+    "joint_rew_scale": 0.5,     # robot joints (guide only)
+    "base_pos_rew_scale": 1.0,
+    "base_rot_rew_scale": 1.0,
+    "pos_rew_scale": 8.0,       # object position (the objective)
+    "rot_rew_scale": 0.2,       # object orientation (barely matters for a box)
+    "contact_rew_scale": 1.0,   # palm -> box-face contact reward
+    "vel_rew_scale": 1.0,       # master scale of the per-block velocity term
+}
+
+# solve params that must stay integers when they reach the optimizer
+SOLVE_INT_KEYS = frozenset({"num_samples", "max_num_iterations"})
+
+
+def config_path() -> Path:
+    """config.yml next to the repo, or wherever STUDIO_CONFIG points."""
+    override = os.environ.get("STUDIO_CONFIG")
+    return Path(override).expanduser() if override else REPO_ROOT / "config.yml"
+
+
+def _path(value: str) -> Path:
+    """Paths in config.yml may use ~ and $VARS, so one checked-in example
+    can serve machines with different layouts."""
+    return Path(os.path.expandvars(str(value))).expanduser()
 
 
 @dataclass
 class Config:
     kimodo_repo: Path
     kimodo_python: Path
-    mppi_locoma: Path
+    solve_python: Path
     model: str
     demo_port: int
     encoder_host: str
     encoder_port: int
-
-    @property
-    def mppi_python(self) -> Path:
-        return self.mppi_locoma / ".venv/bin/python"
+    # A SPIDER checkout or wheel. Needed once by `studio setup` — for the G1
+    # assets and to build the solve venv — never at run time.
+    spider: Path | None = None
+    # Where `studio promote` copies passing trials, if you keep a central
+    # dataset elsewhere.
+    dataset_outputs: Path | None = None
 
     @property
     def model_short(self) -> str:
@@ -42,14 +103,44 @@ class Config:
 
 
 def load_config() -> Config:
-    cfg = yaml.safe_load((REPO_ROOT / "config.yml").read_text())
+    path = config_path()
+    if not path.is_file():
+        raise SystemExit(
+            f"no config at {path}\n"
+            f"  cp {EXAMPLE_CONFIG.name} config.yml   # then edit the paths")
+    cfg = yaml.safe_load(path.read_text())
+    SCENE_DEFAULTS.update(cfg.get("scene") or {})
+    SOLVE_DEFAULTS.update(cfg.get("solve") or {})
     paths = cfg["paths"]
+    optional = {k: paths.get(k) for k in
+                ("kimodo_python", "solve_python", "spider", "dataset_outputs")}
     return Config(
-        kimodo_repo=Path(paths["kimodo_repo"]),
-        kimodo_python=Path(paths["kimodo_python"]),
-        mppi_locoma=Path(paths["mppi_locoma"]),
+        kimodo_repo=_path(paths["kimodo_repo"]),
+        kimodo_python=(_path(optional["kimodo_python"])
+                       if optional["kimodo_python"] else DEFAULT_KIMODO_PYTHON),
+        solve_python=(_path(optional["solve_python"])
+                      if optional["solve_python"] else DEFAULT_SOLVE_PYTHON),
+        spider=_path(optional["spider"]) if optional["spider"] else None,
+        dataset_outputs=(_path(optional["dataset_outputs"])
+                         if optional["dataset_outputs"] else None),
         model=cfg["demo"]["model"],
         demo_port=int(cfg["demo"]["port"]),
         encoder_host=cfg["encoder"]["remote_host"],
         encoder_port=int(cfg["encoder"]["port"]),
     )
+
+
+# ------------------------------------------------------------- runs --
+
+def task_root(run_dir: Path) -> Path:
+    """Where a run's built trials live."""
+    return run_dir / "outputs" / TASK_SUBTREE
+
+
+def task_dirs(run_dir: Path, prefix: str = "") -> list[Path]:
+    """A run's built trial dirs (empty if it was never reconstructed)."""
+    root = task_root(run_dir)
+    if not root.is_dir():
+        return []
+    return sorted(d for d in root.iterdir()
+                  if d.is_dir() and d.name.startswith(prefix))
