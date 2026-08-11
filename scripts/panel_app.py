@@ -143,7 +143,7 @@ class Panel:
                 opts = list(self.sources) or ["<none found>"]
                 self.gui_source.options = opts
 
-        # same controls as the demo's "Scene recon (mppi)" folder
+        # same controls as the demo's "Scene recon" folder
         with gui.add_folder("Scene reconstruction"):
             self.scene_widgets = viz.scene_param_widgets(gui, SCENE_DEFAULTS)
             self.gui_held = gui.add_checkbox("allow held start", False)

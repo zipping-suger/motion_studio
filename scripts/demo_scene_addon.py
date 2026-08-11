@@ -3,8 +3,8 @@
 Wraps the stock demo (kimodo stays pristine): constructs `Demo`, attaches
 an extra GUI folder to the same viser server, then hands control to
 `demo.run()`. The Reconstruct button saves the committed sample as a
-kimodo NPZ into raw_motion/, shells out to `studio recon` (build_trial in
-mppi_locoma's venv — CPU only, no VRAM cost next to the diffusion model),
+kimodo NPZ into raw_motion/, shells out to `studio recon` (CPU only, no
+VRAM cost next to the diffusion model),
 and overlays the reconstructed scene (table, terrain, animated box) on the
 playing motion. Solving stays in the separate solve panel (`studio panel`).
 
@@ -65,13 +65,13 @@ class SceneReconAddon:
         self.box_handle = None
         self.static_handles = []
         self.root = self.server.scene.add_frame(
-            "/mppi_recon", show_axes=False, wxyz=ZUP_TO_YUP_WXYZ)
+            "/scene_recon", show_axes=False, wxyz=ZUP_TO_YUP_WXYZ)
         self._build_gui()
         threading.Thread(target=self._anim_loop, daemon=True).start()
 
     def _build_gui(self):
         gui = self.server.gui
-        with gui.add_folder("Scene recon (mppi)"):
+        with gui.add_folder("Scene recon"):
             self.gui_name = gui.add_text("run name", initial_value="clip")
             self.scene_widgets = viz.scene_param_widgets(gui, SCENE_DEFAULTS)
             # contact window (the period the robot holds the object);
@@ -168,10 +168,10 @@ class SceneReconAddon:
         self.static_handles, self.box_handle = [], None
 
         self.static_handles = viz.add_scene(
-            self.server, task_dir, prefix="/mppi_recon", opacity=0.8)
+            self.server, task_dir, prefix="/scene_recon", opacity=0.8)
         mesh = viz.box_mesh(info)
         self.box_handle = self.server.scene.add_mesh_simple(
-            "/mppi_recon/box", mesh.vertices, mesh.faces,
+            "/scene_recon/box", mesh.vertices, mesh.faces,
             color=(200, 60, 60), opacity=0.6,
             position=box_traj[0, :3], wxyz=box_traj[0, 3:])
         self.state = {"box": box_traj, "sid": client_id}  # publish LAST
@@ -198,7 +198,7 @@ def main() -> None:
     args = ap.parse_args()
     demo = Demo(default_model_name=resolve_model_name(args.model, "Kimodo"))
     SceneReconAddon(demo)
-    print("scene-recon add-on attached (folder 'Scene recon (mppi)')",
+    print("scene-recon add-on attached (folder 'Scene recon')",
           flush=True)
     demo.run()
 

@@ -1,8 +1,7 @@
 """Grasp detection from Kimodo hand-tip kinematics (SceneBot-style hindsight).
 
-Ported from mppi_locoma's `grasp_detect.py`, plus `override_window` —
-studio's own addition, which forces the contact window from the GUIs and
-re-derives everything measured from it.
+`override_window` forces the contact window from the GUIs and re-derives
+everything measured from it.
 
 Primary signal (SceneBot, arXiv 2606.27581, Alg. 1): a contact interval is
 where the key links move with LOW VELOCITY RELATIVE TO THE OBJECT. For a

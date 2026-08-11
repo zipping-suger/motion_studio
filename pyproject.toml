@@ -3,9 +3,8 @@ name = "kimodo-studio"
 version = "0.1.0"
 description = "Interactive Kimodo clip authoring -> scene reconstruction -> dynamically feasible G1+object trajectory"
 requires-python = ">=3.10"
-# studio owns scene reconstruction, so it needs MuJoCo + numpy. It does NOT
-# own the solve: that stays a subprocess of mppi_locoma's venv, which is
-# where torch/warp/spider live.
+# studio owns scene reconstruction, so it needs MuJoCo + numpy. The solve
+# runs as a subprocess of the separate solve venv (torch/warp/SPIDER).
 dependencies = ["pyyaml", "numpy", "mujoco==3.7.0"]
 
 [project.scripts]

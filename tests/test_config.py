@@ -114,7 +114,7 @@ def test_examples_dir_matches_the_demos_hardcoded_save_path(write_config):
 
 # ------------------------------------------------------------- runs --
 
-def test_task_root_mirrors_the_mppi_subtree(tmp_path):
+def test_task_root_mirrors_the_spider_subtree(tmp_path):
     assert config.task_root(tmp_path / "run") == (
         tmp_path / "run/outputs" / config.TASK_SUBTREE)
 

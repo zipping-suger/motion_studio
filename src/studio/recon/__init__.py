@@ -1,11 +1,9 @@
 """Scene reconstruction: a robot-only Kimodo clip -> a physics trial.
 
-This is the science studio owns. It is a port of mppi_locoma's
-reconstruction stack (grasp detection, interaction graph, hindsight scene
-reconstruction, trial emission — all SceneBot-derived, arXiv 2606.27581),
-with one capability that repo has no notion of: forcing the contact
-window and re-deriving everything measured from it, so a misdetected
-window can be corrected from the GUIs.
+This is the science studio owns: grasp detection, interaction graph,
+hindsight scene reconstruction, trial emission (SceneBot-derived, arXiv
+2606.27581) — plus forcing the contact window and re-deriving everything
+measured from it, so a misdetected window can be corrected from the GUIs.
 
 Needs numpy + mujoco and the G1 assets (see `assets.py`); no solver and
 no GPU, so it runs in studio's own venv.

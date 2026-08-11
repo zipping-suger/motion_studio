@@ -5,7 +5,7 @@ warp and the SPIDER wheel:
 
     python -m studio.solve.loop --task T --dataset-dir D [--param k=v ...]
 
-Ported from SPIDER's `examples/run_mjwp.py` by way of mppi_locoma, trimmed
+Derived from SPIDER's `examples/run_mjwp.py`, trimmed
 to the one configuration studio uses — `humanoid_object`, headless, no
 contact guidance, no Gibbs sampling, no video. `spider_cfg.build` asserts
 that envelope, so a config outside it fails loudly instead of silently
@@ -78,7 +78,7 @@ def _env_params(config) -> list[list[dict]]:
     """Per-iteration domain-randomization parameter sets.
 
     num_dr == 1 means the margin/offset endpoints are applied but not
-    varied, which is what mppi_locoma ran.
+    varied.
     """
     assert config.num_dr >= 1, "num_dr must be >= 1 or nothing gets rolled out"
     xy = np.linspace(*config.xy_offset_range, config.num_dr)

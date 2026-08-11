@@ -6,8 +6,8 @@ Unitree's own license, which this repo copies out of an installed SPIDER
 at setup time rather than redistributing.
 
 Provenance: `scene_template.xml` is the omomo `move_largebox` scene from
-SPIDER's example datasets (Meta Platforms, CC-BY-NC), by way of
-mppi_locoma. The meshes and URDF are Unitree G1 assets shipped in
+SPIDER's example datasets (Meta Platforms, CC-BY-NC). The meshes and
+URDF are Unitree G1 assets shipped in
 SPIDER's `assets/robots/unitree_g1/`.
 """
 

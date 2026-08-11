@@ -2,7 +2,7 @@
 
 This is studio's contribution to the solve — the two places where
 SPIDER's generic bimanual-manipulation reward is wrong for a G1 carrying
-a reconstructed box. Ported from mppi_locoma's `retarget/rewards.py`.
+a reconstructed box.
 
 1. Per-block weighted velocity tracking. DynaRetarget (arXiv 2602.06827)
    Table II tracks reference velocities next to positions; its ablation shows

@@ -1,8 +1,6 @@
 """Scene-interaction graph construction (SceneBot, arXiv 2606.27581, Alg. 1
 Stage 2), generalized beyond the bimanual table pick.
 
-Ported unchanged from mppi_locoma's `interaction_graph.py`.
-
 The robot's key links K = {left-wrist, right-wrist, left-foot, right-foot,
 pelvis} each get candidate contact edges wherever the link moves with low
 velocity AND low acceleration relative to a scene node:

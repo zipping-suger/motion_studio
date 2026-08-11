@@ -1,10 +1,6 @@
 """SceneBot-style hindsight scene reconstruction (arXiv 2606.27581, Alg. 1
 Stage 3), generalized for arbitrary motion.
 
-Ported from mppi_locoma's `scene_recon.py`. The only substantive change:
-the scene template and G1 meshes come from this repo (`assets.py`) rather
-than from an installed SPIDER.
-
 From a robot-only kinematic motion + its scene-interaction graph,
 reconstructs:
   - a box object (freejoint body) sized from the carry-phase hand gap,

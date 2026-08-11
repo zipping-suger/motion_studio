@@ -1,9 +1,7 @@
 """Kimodo NPZ -> MuJoCo G1 (29 DoF) qpos.
 
-Ported from mppi_locoma's `kimodo_loader.py`; the joint map and the
-coordinate convention are unchanged. The one difference: the G1 model
-comes from this repo's scene template (see `assets.robot_xml`) rather
-than from an installed SPIDER.
+The G1 model comes from this repo's scene template (see
+`assets.robot_xml`).
 
 Kimodo NPZ format:
     local_rot_mats:  (T, 34, 3, 3) float32 - local rotation matrices (y-up)

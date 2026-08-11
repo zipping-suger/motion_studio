@@ -1,4 +1,4 @@
-"""Layout shimming: the demo's save formats -> mppi_locoma's batch layout."""
+"""Layout shimming: the demo's save formats -> the batch layout recon expects."""
 
 import json
 
@@ -36,8 +36,8 @@ def _write_npz(path, contacts):
 
 
 def test_float_foot_contacts_become_bools(tmp_path):
-    """The demo writes contact probabilities; mppi_locoma's contact graph
-    needs the bools batch_generate would have produced."""
+    """The demo writes contact probabilities; the contact graph needs the
+    bools batch_generate would have produced."""
     src, dst = tmp_path / "src.npz", tmp_path / "dst.npz"
     _write_npz(src, np.array([0.1, 0.5, 0.51, 0.9], dtype=np.float32))
     shim._copy_motion_npz(src, dst)

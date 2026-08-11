@@ -1,16 +1,11 @@
 """Build SPIDER's Config directly — no hydra.
 
-mppi_locoma reached the solve through a hydra tree: `config/default.yaml`
-inherited by `config/override/kimodo_pick.yaml`, then CLI `key=value`
-overrides on top, then `+`-prefixed extras for fields absent from the
-YAML. Three layers to read before you knew what a run actually used.
-
-FIXED below is that whole stack, already resolved, as one dict. It is the
+FIXED below is the whole solve configuration, resolved, as one dict. It is the
 task setup — timesteps, simulator sizing, noise schedule, what is saved.
 The hyperparameters worth tuning live in `config.SOLVE_DEFAULTS` and are
 layered on top per run.
 
-Values are the literals mppi_locoma validated, including `sim_dt` as
+Values are validated literals, including `sim_dt` as
 0.0166667 rather than 1/60: it becomes the MuJoCo timestep
 (`spider/simulators/mjwp.py:80`), so the rounding is load-bearing for
 reproducing a solve.

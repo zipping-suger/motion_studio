@@ -1,8 +1,7 @@
 """Retargeting quality for built trials.
 
-Ported from mppi_locoma's `scripts/eval_trials.py`. numpy only — no torch,
-no SPIDER — so it runs in studio's own venv and the verdict never needs
-the solve runtime.
+numpy only — no torch, no SPIDER — so it runs in studio's own venv and
+the verdict never needs the solve runtime.
 
 Primary success is the LIFT: the box must rise at least 70% of the
 reference lift and end within 0.2 m of the reference final position.
