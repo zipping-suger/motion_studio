@@ -13,8 +13,9 @@ import urllib.request
 from pathlib import Path
 
 from . import manifest, pipeline, recon, solve
-from .config import (REPO_ROOT, RUNS_DIR, SCENE_DEFAULTS, SOLVE_DEFAULTS,
-                     SOLVE_INT_KEYS, Config, load_config, task_dirs)
+from .config import (DEFAULT_KIMODO_VISER, REPO_ROOT, RUNS_DIR,
+                     SCENE_DEFAULTS, SOLVE_DEFAULTS, SOLVE_INT_KEYS, Config,
+                     load_config, task_dirs)
 from .watch import watch_examples
 
 
@@ -27,13 +28,33 @@ def _run(cmd, env=None) -> None:
 def _spider(cfg: Config, explicit: str | None) -> Path:
     """A SPIDER checkout (or wheel). Needed only at setup: the G1 assets
     are Unitree-licensed and SPIDER is CC-BY-NC, so this repo redistributes
-    neither — it copies what it needs from your install."""
+    neither — it copies what it needs from a checkout (by default the
+    extern/spider submodule, initialized on demand)."""
     for candidate in (explicit, os.environ.get("SPIDER_ROOT"), cfg.spider):
         if candidate:
             return Path(candidate).expanduser()
     raise SystemExit(
         "no SPIDER install configured. Set paths.spider in config.yml, or:\n"
         "  studio setup --spider <checkout or .whl>")
+
+
+def _checked_out(repo: Path) -> bool:
+    # a submodule checkout has a .git *file*; an uninitialized one is an
+    # empty dir
+    return (repo / ".git").exists()
+
+
+def _init_submodules(*repos: Path) -> None:
+    """Fresh clones made without --recurse-submodules leave extern/ empty;
+    fetch the pinned checkouts before a stage needs them. Paths outside
+    extern/ (config.yml overrides, wheels) are left alone."""
+    extern = REPO_ROOT / "extern"
+    need = sorted({str(r) for r in repos
+                   if r is not None and extern in r.parents
+                   and not _checked_out(r)})
+    if need:
+        _run(["git", "-C", REPO_ROOT, "submodule", "update", "--init",
+              "--depth", "1", *need])
 
 
 def _setup_assets(cfg: Config, spider: Path) -> None:
@@ -53,9 +74,13 @@ def _setup_kimodo(cfg: Config) -> None:
     # clobbering the editable install of the local clone below
     _run(pip + ["-e", cfg.kimodo_repo],
          env={"SKIP_MOTION_CORRECTION_IN_SETUP": "1"})
-    local_viser = cfg.kimodo_repo / "kimodo-viser"
-    if local_viser.is_dir():
-        _run(pip + ["-e", local_viser])
+    # the demo needs the kimodo-viser fork; prefer a local checkout (a
+    # kimodo checkout with the fork cloned inside it, else the extern/
+    # submodule) so it installs editable and pinned
+    for local_viser in (cfg.kimodo_repo / "kimodo-viser", DEFAULT_KIMODO_VISER):
+        if _checked_out(local_viser):
+            _run(pip + ["-e", local_viser])
+            break
     else:
         _run(pip + ["viser @ git+https://github.com/nv-tlabs/kimodo-viser.git"])
 
@@ -83,6 +108,13 @@ def cmd_setup(cfg: Config, args) -> int:
     stages = stages or ["assets", "kimodo", "solve"]
     spider = _spider(cfg, args.spider) if {"assets", "solve"} & set(stages) \
         else None
+
+    wanted = [spider]
+    if "kimodo" in stages:
+        wanted.append(cfg.kimodo_repo)
+        if not (cfg.kimodo_repo / "kimodo-viser").is_dir():
+            wanted.append(DEFAULT_KIMODO_VISER)
+    _init_submodules(*wanted)
 
     if "assets" in stages:
         _setup_assets(cfg, spider)

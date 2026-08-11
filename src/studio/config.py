@@ -9,13 +9,19 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNS_DIR = REPO_ROOT / "runs"
 RAW_MOTION_DIR = REPO_ROOT / "raw_motion"
-EXAMPLE_CONFIG = REPO_ROOT / "config.example.yml"
 
 # where `studio setup` puts the two heavy runtimes unless config.yml
 # overrides them. Each is a third-party stack with its own pinned torch, so
 # they stay out of studio's own venv.
 DEFAULT_KIMODO_PYTHON = REPO_ROOT / ".venv-kimodo/bin/python"
 DEFAULT_SOLVE_PYTHON = REPO_ROOT / ".venv-solve/bin/python"
+
+# the pinned upstream checkouts (git submodules). `studio setup` initializes
+# them on demand; config.yml's paths section overrides them with checkouts
+# you manage elsewhere (e.g. a fork you hack on).
+DEFAULT_KIMODO_REPO = REPO_ROOT / "extern/kimodo"
+DEFAULT_KIMODO_VISER = REPO_ROOT / "extern/kimodo-viser"
+DEFAULT_SPIDER = REPO_ROOT / "extern/spider"
 
 # SPIDER's trial layout (spider.io.get_processed_data_dir); trials of run
 # <name> live at <run>/outputs/<TASK_SUBTREE>/<task>/. The solve resolves
@@ -83,7 +89,7 @@ class Config:
     encoder_port: int
     # A SPIDER checkout or wheel. Needed once by `studio setup` — for the G1
     # assets and to build the solve venv — never at run time.
-    spider: Path | None = None
+    spider: Path = DEFAULT_SPIDER
     # Where `studio promote` copies passing trials, if you keep a central
     # dataset elsewhere.
     dataset_outputs: Path | None = None
@@ -103,30 +109,30 @@ class Config:
 
 
 def load_config() -> Config:
+    """config.yml is optional: every value has a default (the external repos
+    default to the extern/ submodules), so a fresh clone works with no config
+    at all. The file only overrides."""
     path = config_path()
-    if not path.is_file():
-        raise SystemExit(
-            f"no config at {path}\n"
-            f"  cp {EXAMPLE_CONFIG.name} config.yml   # then edit the paths")
-    cfg = yaml.safe_load(path.read_text())
+    cfg = (yaml.safe_load(path.read_text()) or {}) if path.is_file() else {}
     SCENE_DEFAULTS.update(cfg.get("scene") or {})
     SOLVE_DEFAULTS.update(cfg.get("solve") or {})
-    paths = cfg["paths"]
-    optional = {k: paths.get(k) for k in
-                ("kimodo_python", "solve_python", "spider", "dataset_outputs")}
+    paths = cfg.get("paths") or {}
+    demo = cfg.get("demo") or {}
+    encoder = cfg.get("encoder") or {}
+
+    def opt(key: str, default):
+        return _path(paths[key]) if paths.get(key) else default
+
     return Config(
-        kimodo_repo=_path(paths["kimodo_repo"]),
-        kimodo_python=(_path(optional["kimodo_python"])
-                       if optional["kimodo_python"] else DEFAULT_KIMODO_PYTHON),
-        solve_python=(_path(optional["solve_python"])
-                      if optional["solve_python"] else DEFAULT_SOLVE_PYTHON),
-        spider=_path(optional["spider"]) if optional["spider"] else None,
-        dataset_outputs=(_path(optional["dataset_outputs"])
-                         if optional["dataset_outputs"] else None),
-        model=cfg["demo"]["model"],
-        demo_port=int(cfg["demo"]["port"]),
-        encoder_host=cfg["encoder"]["remote_host"],
-        encoder_port=int(cfg["encoder"]["port"]),
+        kimodo_repo=opt("kimodo_repo", DEFAULT_KIMODO_REPO),
+        kimodo_python=opt("kimodo_python", DEFAULT_KIMODO_PYTHON),
+        solve_python=opt("solve_python", DEFAULT_SOLVE_PYTHON),
+        spider=opt("spider", DEFAULT_SPIDER),
+        dataset_outputs=opt("dataset_outputs", None),
+        model=demo.get("model", "Kimodo-G1-RP-v1"),
+        demo_port=int(demo.get("port", 7860)),
+        encoder_host=encoder.get("remote_host", "euler"),
+        encoder_port=int(encoder.get("port", 9550)),
     )
 
 

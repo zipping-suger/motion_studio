@@ -23,11 +23,15 @@ optimizer and the batched mujoco_warp simulator underneath, as a library.
 
 | what | why | when |
 |---|---|---|
-| `kimodo` checkout | viser demo, diffusion model, motion NPZ I/O | run time |
-| a SPIDER checkout | G1 assets + the solve venv it builds | **setup only** |
+| `extern/kimodo` submodule | viser demo, diffusion model, motion NPZ I/O | run time |
+| `extern/kimodo-viser` submodule | the demo's viser fork | setup only |
+| `extern/spider` submodule | G1 assets + the solve venv it builds | **setup only** |
 
-Everything else `studio setup` creates. There are no sibling-repo paths at run
-time — set two paths in `config.yml` and the repo is self-contained.
+The three upstream repos are pinned as shallow git submodules; `studio setup`
+initializes any that are missing, so plain `git clone` works — no
+`--recurse-submodules` needed. Everything else `studio setup` creates.
+`config.yml` is optional: create one only to override a default, e.g. to point
+`paths.kimodo_repo` at a fork you hack on instead of the submodule.
 
 Three venvs, because each third-party stack pins its own torch:
 
@@ -43,9 +47,8 @@ only arrive when you ask for them.
 ## Setup (once)
 
 ```bash
-cp config.example.yml config.yml   # edit kimodo_repo and spider
-uv sync                            # studio's own venv
-uv run studio setup                # G1 assets + both heavy venvs
+uv sync              # studio's own venv
+uv run studio setup  # submodules + G1 assets + both heavy venvs
 ```
 
 Stages can be run alone: `studio setup --assets`, `--kimodo`, `--solve`.
@@ -193,9 +196,10 @@ configuration studio uses; `solve/rewards.py` and `solve/evaluate.py` come from
 mppi_locoma, the latter implementing DynaRetarget's criteria (arXiv 2602.06827).
 
 **SPIDER is CC-BY-NC** (Meta Platforms), and `assets/scene_template.xml` is
-derived from it, so this repo inherits that non-commercial restriction. The G1
-meshes and URDF are Unitree assets, copied out of a SPIDER install at setup
-rather than redistributed here; their `LICENSE` lands in `assets/g1/`.
+derived from it, so this repo inherits that non-commercial restriction. SPIDER
+itself is referenced as a submodule pointer, not redistributed. The G1 meshes
+and URDF are Unitree assets, copied out of the SPIDER checkout at setup rather
+than redistributed here; their `LICENSE` lands in `assets/g1/`.
 
 ## Notes
 
