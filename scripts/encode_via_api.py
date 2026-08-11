@@ -11,6 +11,7 @@ Usage (tunnel up, e.g. after `studio tunnel <node>`):
 """
 
 import argparse
+import hashlib
 import os
 import shutil
 import sys
@@ -37,10 +38,46 @@ def collect_unique_prompts(batch_dir: str) -> list:
     return list(dict.fromkeys(prompts))
 
 
+def read_prompt_files(paths) -> list:
+    """One prompt per line; '#' comments and blank lines dropped. Keeps a
+    banked prompt set under version control instead of in shell history."""
+    out = []
+    for p in paths:
+        for line in Path(p).read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                out.append(line)
+    return out
+
+
+def _words(text: str) -> list:
+    return "".join(c if c.isalnum() or c.isspace() else " "
+                   for c in text.lower()).split()
+
+
 def _slug(text: str) -> str:
-    words = "".join(c if c.isalnum() or c.isspace() else " "
-                    for c in text.lower()).split()
-    return "_".join(words[:6]) or "prompt"
+    return "_".join(_words(text)[:6]) or "prompt"
+
+
+def unique_slugs(texts: list) -> list:
+    """One filename per prompt, readable and collision-free. Six words is
+    usually enough, but prompts that share a prefix ("A person picks up a
+    box from the floor ..." vs "... from low on their left side") collide,
+    so the slug grows until they diverge. Two prompts identical for 16
+    words fall back to a content hash — a silent overwrite would lose an
+    embedding that costs a GPU job to recompute."""
+    for n in range(6, 17):
+        slugs = ["_".join(_words(t)[:n]) or "prompt" for t in texts]
+        if len(set(slugs)) == len(slugs):
+            return slugs
+    return [f"{s}_{hashlib.sha256(t.encode()).hexdigest()[:6]}"
+            if slugs.count(s) > 1 else s
+            for s, t in zip(slugs, texts)]
+
+
+def save_npz(path, texts, embeddings, lengths) -> None:
+    np.savez(path, texts=np.array(list(texts)), embeddings=embeddings,
+             lengths=np.array(list(lengths), dtype=np.int64))
 
 
 def main():
@@ -49,17 +86,24 @@ def main():
                     help="dir with motion_*/meta.json to sweep")
     ap.add_argument("--text", action="append", default=[],
                     help="prompt string to encode (repeatable)")
+    ap.add_argument("--file", action="append", default=[],
+                    help="file of prompts, one per line, '#' comments and "
+                         "blank lines ignored (repeatable)")
     ap.add_argument("--url",
                     default=os.environ.get("TEXT_ENCODER_URL",
                                            DEFAULT_TEXT_ENCODER_URL))
     ap.add_argument("--output", default=None)
+    ap.add_argument("--split", action="store_true",
+                    help="write one snapshot per prompt, named by its text, "
+                         "instead of a single combined file")
     args = ap.parse_args()
 
     prompts = collect_unique_prompts(args.batch_dir) if args.batch_dir else []
-    prompts += [t for t in sanitize_texts(args.text) if t.strip()]
+    prompts += [t for t in sanitize_texts(args.text + read_prompt_files(args.file))
+                if t.strip()]
     prompts = list(dict.fromkeys(prompts))
     if not prompts:
-        sys.exit("No prompts: pass --batch_dir and/or --text")
+        sys.exit("No prompts: pass --batch_dir, --text and/or --file")
     for p in prompts:
         print(f"  - {p}")
 
@@ -77,23 +121,31 @@ def main():
 
     snap_dir = Path(__file__).resolve().parents[1] / "offline_cache/snapshots"
     snap_dir.mkdir(parents=True, exist_ok=True)
-    if args.batch_dir:
-        output_path = args.output or os.path.join(args.batch_dir,
-                                                  "text_embeddings.npz")
-        snap = snap_dir / f"{Path(args.batch_dir).resolve().name}.npz"
-    else:
-        output_path = args.output or str(snap_dir / f"{_slug(prompts[0])}.npz")
-        snap = Path(output_path)
 
-    np.savez(
-        output_path,
-        texts=np.array(prompts),
-        embeddings=embeddings,
-        lengths=np.array(lengths, dtype=np.int64),
-    )
-    print(f"Saved {embeddings.shape} embeddings to {output_path}")
-    if snap != Path(output_path):
+    # batch_generate.py auto-detects ONE combined text_embeddings.npz beside
+    # the motions, so a batch run always gets that file whatever --split says;
+    # --split only reshapes our own snapshot store.
+    if args.batch_dir:
+        output_path = Path(args.output or os.path.join(args.batch_dir,
+                                                       "text_embeddings.npz"))
+        save_npz(output_path, prompts, embeddings, lengths)
+        print(f"Saved {embeddings.shape} embeddings to {output_path}")
+
+    if args.split:
+        for i, name in enumerate(unique_slugs(prompts)):
+            save_npz(snap_dir / f"{name}.npz", prompts[i:i + 1],
+                     embeddings[i:i + 1], lengths[i:i + 1])
+            print(f"  {name}.npz")
+        print(f"{len(prompts)} snapshot(s) in {snap_dir}")
+        return
+
+    if args.batch_dir:
+        snap = snap_dir / f"{Path(args.batch_dir).resolve().name}.npz"
         shutil.copy2(output_path, snap)
+    else:
+        snap = Path(args.output or snap_dir / f"{_slug(prompts[0])}.npz")
+        save_npz(snap, prompts, embeddings, lengths)
+        print(f"Saved {embeddings.shape} embeddings to {snap}")
     print(f"Snapshot for offline demo use: {snap}")
 
 

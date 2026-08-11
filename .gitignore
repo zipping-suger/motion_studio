@@ -4,7 +4,11 @@ config.yml
 # working dirs: pipeline outputs, authored clips, cached embeddings
 runs/
 raw_motion/
-offline_cache/
+# offline_cache/* not offline_cache/: git cannot re-include a file whose
+# parent dir is excluded, and prompts.txt is source, not cache — it is the
+# record of what to re-bank when the tunnel is next up
+offline_cache/*
+!offline_cache/prompts.txt
 
 # G1 meshes + URDF: Unitree-licensed binaries, fetched by `studio setup`
 assets/g1/

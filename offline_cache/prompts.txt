@@ -1,0 +1,32 @@
+# Prompts banked for offline authoring: box lifting and placing.
+#
+# Bank them (tunnel up):
+#   .venv-kimodo/bin/python scripts/encode_via_api.py \
+#       --file offline_cache/prompts.txt --split
+#
+# --split writes one snapshot per prompt, named by its text, so a single
+# prompt can be added, inspected or dropped on its own. Re-running is
+# idempotent: unchanged lines overwrite with identical bytes.
+#
+# Only the text matters — duration, seed, constraints and num_samples
+# stay freely editable offline. Blank lines and #-comments are ignored.
+
+# lift from the ground
+A person crouches, grabs a box off the ground, then hoists it high above their head.
+A person bends down, picks up a box from the floor, and stands up straight holding it.
+A person lifts a box off the ground and carries it forward a few steps.
+
+# place
+A person picks up a box from the floor and places it on a table.
+A person carrying a box lowers it and sets it down on the ground.
+A person picks up a box from low on their left side and places it up high.
+
+# already banked (offline_cache/snapshots/a_person_lifts_a_box_from.npz);
+# re-encoding is harmless and keeps this file the whole record
+A person lifts a box from the floor and walks forward.
+
+# Not box prompts, but the demo submits them on its own: DEFAULT_PROMPT sits
+# in the prompt box at startup and gets prewarmed, and the one remaining
+# example dir loads its text. Unbanked, both cache a silent zero.
+A person walks forward.
+A person walking forward quickly stumbles but maintains their balance
