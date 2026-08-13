@@ -1,19 +1,29 @@
-# kimodo_studio
+# motion_studio
 
-Generate a single G1 motion clip with
-[Kimodo](https://github.com/nv-tlabs/kimodo), reconstruct the scene it implies,
-and solve for a **dynamically feasible robot+object trajectory**
+Generate a single G1 motion clip with [Kimodo](https://github.com/nv-tlabs/kimodo), reconstruct the scene it implies, and solve for a **dynamically feasible robot+object trajectory**
 ([SPIDER](https://github.com/facebookresearch/spider) + mujoco_warp).
 
-<!-- TODO: demo gif — panel side-by-side (reference vs. solved) is the money shot -->
-<!-- ![demo](docs/demo.gif) -->
+<!-- regenerate: MUJOCO_GL=egl .venv-solve/bin/python scripts/render_docs_gifs.py -->
+
+**Generate** — Kimodo turns a text prompt into a motion clip (the checked-in
+`samples/box_carrying.npz`):
+
+![Kimodo motion generation](docs/generate.gif)
+
+**Reconstruct** — the clip is retargeted to the G1 and the scene it implies
+(the box and its placement) is inferred in hindsight:
+
+![hindsight scene reconstruction](docs/recon.gif)
+
+**Solve** — sampling-based MPC in mujoco_warp turns the kinematic reference
+into a dynamically feasible robot+object trajectory:
+
+![kinematic reference vs. solved trajectory](docs/solve.gif)
 
 ## Setup (once)
 
-Everything runs on your workstation (one CUDA GPU, ~16 GB — the demo and the
-solve share it) **except the text encoder**: prompts are embedded by
-LLM2Vec-8B, too heavy for a desktop GPU, so it runs as a cluster job (the
-provided script requests an RTX 3090) and streams back over an SSH tunnel.
+Everything runs on your workstation **except the text encoder**: prompts are embedded by
+LLM2Vec-8B, too heavy for a desktop GPU, so it runs as a cluster job and streams back over an SSH tunnel.
 
 **On the cluster** — stage three things, once:
 
@@ -93,18 +103,6 @@ uv run studio list               # runs + LIFT / DR verdicts
 
 `studio -h` lists the rest (`run`, `view`, `promote`, per-flag help on each).
 
-## Notes
-
-- **The contact window is the main knob**: pick → release sets the box size,
-  rest pose, and contact rewards. Default is the full clip; in the panel, drag
-  `contact start`/`end` until the orange ghost box looks right.
-- **Solves are not run-to-run reproducible** (GPU reductions) — judge by the
-  verdict over several runs. Reconstruction is exact.
-- **Reach-only clips are SKIPPED**: no object interaction, no scene to build.
-- Runs are self-contained under `runs/<name>/` (scene.xml, trajectories,
-  `manifest.json`: prompt, seed, params, verdict). Internals live in
-  `src/studio/recon/` and `src/studio/solve/`.
-
 ## References
 
 - **Kimodo** — Rempe et al., *Kimodo: Scaling Controllable Human Motion
@@ -125,11 +123,3 @@ uv run studio list               # runs + LIFT / DR verdicts
   Retargeting using Sampling-Based Trajectory Optimization* —
   [arXiv:2602.06827](https://arxiv.org/abs/2602.06827). The LIFT / DR
   verdicts implement its feasibility criteria.
-
-## Licensing
-
-**SPIDER is CC-BY-NC** (Meta Platforms) and `assets/scene_template.xml`
-derives from it, so this repo inherits the non-commercial restriction; SPIDER
-is referenced as a submodule pointer, not redistributed. The G1 meshes/URDF
-are Unitree assets, copied from the SPIDER checkout at setup; their license
-lands in `assets/g1/LICENSE`.
