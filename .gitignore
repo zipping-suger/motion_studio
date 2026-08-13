@@ -5,10 +5,14 @@ config.yml
 runs/
 raw_motion/
 # offline_cache/* not offline_cache/: git cannot re-include a file whose
-# parent dir is excluded, and prompts.txt is source, not cache — it is the
-# record of what to re-bank when the tunnel is next up
+# parent dir is excluded. prompts.txt is source, not cache — the record of
+# what to re-bank when the tunnel is next up. snapshots/ are the banked
+# embeddings themselves (16 KB/prompt, cluster-only to regenerate): tracked
+# so `studio demo --offline` works straight from a clone. embeddings/ stays
+# ignored — it is re-derived from the snapshots at demo startup.
 offline_cache/*
 !offline_cache/prompts.txt
+!offline_cache/snapshots/
 
 # G1 meshes + URDF: Unitree-licensed binaries, fetched by `studio setup`
 assets/g1/
