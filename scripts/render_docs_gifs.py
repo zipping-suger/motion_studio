@@ -201,8 +201,8 @@ def main():
     for t in ts:
         cam.lookat[:] = lookat[t]
         img = stage.frame(cam, skeleton=skel[t])
-        gen.append(caption(img, "“A person lifts a box off the ground "
-                                "and carries it forward…”"))
+        gen.append(caption(img, "“A person walking with a box and "
+                                "placing it on the ground.”"))
     encode_gif(gen, args.out / "generate.gif")
 
     # -- 2. recon: the bare clip dissolves into the inferred scene -------
