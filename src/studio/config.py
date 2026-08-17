@@ -24,9 +24,12 @@ DEFAULT_KIMODO_VISER = REPO_ROOT / "extern/kimodo-viser"
 DEFAULT_SPIDER = REPO_ROOT / "extern/spider"
 
 # SPIDER's trial layout (spider.io.get_processed_data_dir); trials of run
-# <name> live at <run>/outputs/<TASK_SUBTREE>/<task>/. The solve resolves
-# the same path from dataset_dir, so this must stay in step with it.
-TASK_SUBTREE = Path("processed/kimodo/unitree_g1/humanoid_object")
+# <name> live at <run>/outputs/<PROCESSED_ROOT>/<embodiment>/<task>/. The
+# embodiment segment is per downstream task (box carry tracks an object,
+# obstacle tasks are robot-only); TASK_SUBTREE is the box-carry one, which
+# SPIDER's own dataset resolution must keep matching.
+PROCESSED_ROOT = Path("processed/kimodo/unitree_g1")
+TASK_SUBTREE = PROCESSED_ROOT / "humanoid_object"
 
 # Scene-reconstruction parameters, as all three GUIs expose them.
 # They live here, not in studio.recon, because the demo add-on runs in the
@@ -64,6 +67,12 @@ SOLVE_DEFAULTS = {
 
 # solve params that must stay integers when they reach the optimizer
 SOLVE_INT_KEYS = frozenset({"num_samples", "max_num_iterations"})
+
+# config.yml's optional `tasks:` section — per-task defaults overrides,
+# e.g. tasks: {under_table: {scene: {yaw_range: 0}, solve: {...}}}. The
+# dicts above are the box_carry task's equivalents, kept at top level for
+# backward compatibility. Consumed via studio.tasks.overrides().
+TASK_OVERRIDES: dict = {}
 
 
 def config_path() -> Path:
@@ -116,6 +125,8 @@ def load_config() -> Config:
     cfg = (yaml.safe_load(path.read_text()) or {}) if path.is_file() else {}
     SCENE_DEFAULTS.update(cfg.get("scene") or {})
     SOLVE_DEFAULTS.update(cfg.get("solve") or {})
+    TASK_OVERRIDES.clear()
+    TASK_OVERRIDES.update(cfg.get("tasks") or {})
     paths = cfg.get("paths") or {}
     demo = cfg.get("demo") or {}
     encoder = cfg.get("encoder") or {}
@@ -139,14 +150,18 @@ def load_config() -> Config:
 # ------------------------------------------------------------- runs --
 
 def task_root(run_dir: Path) -> Path:
-    """Where a run's built trials live."""
+    """Where a run's built box-carry trials live."""
     return run_dir / "outputs" / TASK_SUBTREE
 
 
 def task_dirs(run_dir: Path, prefix: str = "") -> list[Path]:
-    """A run's built trial dirs (empty if it was never reconstructed)."""
-    root = task_root(run_dir)
+    """A run's built trial dirs, across every task's embodiment subtree
+    (empty if it was never reconstructed). A run only ever holds one task
+    type, so the union is that task's trials."""
+    root = run_dir / "outputs" / PROCESSED_ROOT
     if not root.is_dir():
         return []
-    return sorted(d for d in root.iterdir()
-                  if d.is_dir() and d.name.startswith(prefix))
+    return sorted((d for emb in root.iterdir() if emb.is_dir()
+                   for d in emb.iterdir()
+                   if d.is_dir() and d.name.startswith(prefix)),
+                  key=lambda d: d.name)

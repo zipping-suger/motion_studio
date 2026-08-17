@@ -103,6 +103,53 @@ uv run studio list               # runs + LIFT / DR verdicts
 
 `studio -h` lists the rest (`run`, `view`, `promote`, per-flag help on each).
 
+## Downstream tasks
+
+Recon and solve are pluggable per **task** (`src/studio/tasks/`); every run
+records its task and `studio solve` / `studio list` follow it. `box_carry`
+(everything above) is the default. The second task is collision-free
+augmentation:
+
+**`under_table`** — an under-table-pick clip implies a table; place a
+randomized one (slab + 4 legs, seeded jitter + yaw) over the ducking robot
+from head-trajectory FK, then re-solve with receding-horizon MPPI so the
+robot tracks the reference while actually avoiding the now-solid table
+(tracking + stability + analytic-SDF avoidance rewards). Verification:
+SDF penetration, pelvis drift, and the pick-hand task-preservation check.
+
+```bash
+uv run studio recon <under_table_pick clip>.npz --task under_table \
+    --name ut0 --scene-seed 3          # placement is seeded: new seed, new scene
+uv run studio solve ut0                # --set num_samples=1024 if VRAM is tight
+uv run studio list                     # PASS = collision-free + task preserved
+```
+
+Or in the panel: `uv run studio panel`, task `under_table`, pick a clip from
+`raw_motion/` → **1. Estimate table** (change the seed / difficulty knobs and
+re-estimate; the table redraws) → **2. Solve MPPI** → reference (transparent)
+vs augmented (solid) playback. `studio view <run>` opens an existing run in
+the right mode.
+
+**`kick`** — a Kimodo-generated kick clip; place a randomized
+floor-standing box in the kicking foot's approach path (seeded position
+along the path, lateral/yaw jitter) so the reference swing penetrates it,
+then re-solve. Placement guarantees the kick point itself stays outside
+the box and the rest of the body clears it — only the kicking leg
+conflicts, and re-pathing it is the solver's work. Verification adds the
+kick-preservation check (kicking foot vs the reference kick point).
+
+```bash
+uv run studio recon <kick clip>.npz --task kick --name k0 --scene-seed 2
+uv run studio solve k0
+```
+
+Task knobs (difficulty, reward weights, verify thresholds) live in
+`src/studio/tasks/<task>_params.py`; override per machine via config.yml's
+`tasks:` section or per run via `--set key=value`. The under-table
+estimation and both tasks' rewards port the `mppi_obstacle` experiment's
+certified defaults (see that repo's README for the difficulty sweeps);
+the kick solve weights are starting points, not yet swept.
+
 ## References
 
 - **Kimodo** — Rempe et al., *Kimodo: Scaling Controllable Human Motion

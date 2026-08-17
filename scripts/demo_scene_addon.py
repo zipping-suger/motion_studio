@@ -16,6 +16,7 @@ child poses stay in z-up scene coordinates.
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -75,8 +76,15 @@ class SceneReconAddon:
             self.gui_name = gui.add_text("run name", initial_value="clip")
             self.scene_widgets = viz.scene_param_widgets(gui, SCENE_DEFAULTS)
             # contact window (the period the robot holds the object);
-            # -1 = full clip. The reconstruct status line reports the
-            # window used — set frames to correct it and re-click.
+            # -1 = full clip. "auto window" hands the choice to the grasp
+            # detector instead ("allow held start" lets it accept a clip
+            # that begins mid-hold); the reconstruct status line reports
+            # the window actually used, and after an auto run the detected
+            # frames land in the fields — untick auto to correct from
+            # there and re-click.
+            self.gui_auto = gui.add_checkbox("auto window", False)
+            self.gui_held = gui.add_checkbox("allow held start", False,
+                                             disabled=True)
             self.gui_cstart = gui.add_number("contact start", -1, min=-1,
                                              step=1)
             self.gui_cend = gui.add_number("contact end", -1, min=-1, step=1)
@@ -88,6 +96,13 @@ class SceneReconAddon:
         @self.gui_show.on_update
         def _(_):
             self.root.visible = self.gui_show.value
+
+        @self.gui_auto.on_update
+        def _(_):
+            auto = self.gui_auto.value
+            self.gui_cstart.disabled = auto
+            self.gui_cend.disabled = auto
+            self.gui_held.disabled = not auto
 
         @self.btn.on_click
         def _(event: viser.GuiEvent):
@@ -127,12 +142,18 @@ class SceneReconAddon:
             flags = []
             for k, w in self.scene_widgets.items():
                 flags += [f"--{k.replace('_', '-')}", str(w.value)]
-            # explicit window always: -1 defaults to the full clip (start
-            # at 0 implies a held start — box spawns in the hands)
-            T = int(motion.joints_pos.shape[0])
-            cs, ce = int(self.gui_cstart.value), int(self.gui_cend.value)
-            flags += ["--pick-frame", str(cs if cs >= 0 else 0),
-                      "--release-frame", str(ce if ce >= 0 else T - 1)]
+            if self.gui_auto.value:
+                # no window flags: recon's grasp detector picks the window
+                if self.gui_held.value:
+                    flags.append("--allow-held-start")
+            else:
+                # explicit window: -1 defaults to the full clip (start at
+                # 0 implies a held start — box spawns in the hands)
+                T = int(motion.joints_pos.shape[0])
+                cs = int(self.gui_cstart.value)
+                ce = int(self.gui_cend.value)
+                flags += ["--pick-frame", str(cs if cs >= 0 else 0),
+                          "--release-frame", str(ce if ce >= 0 else T - 1)]
             proc = subprocess.run(
                 [studio_bin(), "recon", str(npz_path), "--name", name,
                  *flags],
@@ -147,6 +168,13 @@ class SceneReconAddon:
                 self.md.content = f"**failed/skipped**\n```\n{tail}\n```"
                 return
             self._load_overlay(tasks[0], client_id)
+            if self.gui_auto.value:
+                # surface the detected window in the fields, so unticking
+                # auto lets the user correct from it instead of from -1
+                m = re.search(r"pick f(\d+) release f(\d+)", pick_line)
+                if m:
+                    self.gui_cstart.value = int(m.group(1))
+                    self.gui_cend.value = int(m.group(2))
             self.md.content = (
                 f"```\n{pick_line.split(' -> ')[0]}\n```\n"
                 f"saved `runs/{name}` — solve it in `studio panel`")

@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from . import manifest, pipeline, recon, solve
+from . import manifest, pipeline, recon, solve, tasks
 from .config import (DEFAULT_KIMODO_VISER, REPO_ROOT, RUNS_DIR,
                      SCENE_DEFAULTS, SOLVE_DEFAULTS, SOLVE_INT_KEYS, Config,
                      load_config, task_dirs)
@@ -228,7 +228,8 @@ def _resolve_example(cfg: Config, spec: str) -> Path | None:
 def cmd_run(cfg: Config, args) -> int:
     src = Path(args.example)
     if src.is_file() and src.suffix == ".npz":
-        return 0 if pipeline.process_example(cfg, src.resolve()) else 1
+        return 0 if pipeline.process_example(cfg, src.resolve(),
+                                             task_type=args.task) else 1
     example = _resolve_example(cfg, args.example)
     if example is None:
         print(f"no example dir or .npz: {args.example} "
@@ -240,22 +241,60 @@ def cmd_run(cfg: Config, args) -> int:
         print(f"{example} is not a Save Example dir (missing {missing})",
               file=sys.stderr)
         return 1
-    return 0 if pipeline.process_example(cfg, example) else 1
+    return 0 if pipeline.process_example(cfg, example,
+                                         task_type=args.task) else 1
 
 
-def _recon_options(args) -> dict:
-    """CLI flags -> recon.reconstruct kwargs, carrying only what was set
-    so unspecified params keep their SCENE_DEFAULTS values."""
-    scene_params = {k: getattr(args, k) for k in SCENE_DEFAULTS
-                    if getattr(args, k, None) is not None}
-    options = {"allow_held_start": args.allow_held_start}
-    if scene_params:
-        options["scene_params"] = scene_params
-    if args.pick_frame is not None:
-        options["pick"] = args.pick_frame
-    if args.release_frame is not None:
-        options["release"] = args.release_frame
-    return options
+def _parse_set(items, defaults: dict, task_name: str, what: str) -> dict:
+    """--set KEY=VALUE pairs, keys validated against the task's defaults
+    (values stay strings; each consumer coerces to the default's type)."""
+    out = {}
+    for item in items or []:
+        key, sep, value = item.partition("=")
+        key = key.strip()
+        if not sep:
+            raise SystemExit(f"--set expects KEY=VALUE, got {item!r}")
+        if key not in defaults:
+            raise SystemExit(
+                f"unknown {task_name} {what} param {key!r} "
+                f"(known: {', '.join(sorted(defaults))})")
+        out[key] = value.strip()
+    return out
+
+
+def _recon_options(task_obj, args) -> dict:
+    """CLI flags -> task reconstruct options, carrying only what was set
+    so unspecified params keep their defaults."""
+    box_flags = {k: getattr(args, k) for k in SCENE_DEFAULTS
+                 if getattr(args, k, None) is not None}
+    set_params = _parse_set(args.set, task_obj.scene_defaults,
+                            task_obj.name, "scene")
+
+    if task_obj.name == "box_carry":
+        if args.scene_seed is not None:
+            raise SystemExit("--scene-seed applies to obstacle tasks only")
+        options = {"allow_held_start": args.allow_held_start}
+        scene_params = {**box_flags, **set_params}
+        if scene_params:
+            options["scene_params"] = scene_params
+        if args.pick_frame is not None:
+            options["pick"] = args.pick_frame
+        if args.release_frame is not None:
+            options["release"] = args.release_frame
+        return options
+
+    box_only = sorted(box_flags) + [
+        flag for flag, val in (("--allow-held-start", args.allow_held_start),
+                               ("--pick-frame", args.pick_frame),
+                               ("--release-frame", args.release_frame))
+        if val not in (None, False)]
+    if box_only:
+        raise SystemExit(f"{', '.join(box_only)}: box_carry-only flag(s); "
+                         f"use --set key=value for {task_obj.name} params")
+    scene_params = dict(set_params)
+    if args.scene_seed is not None:
+        scene_params["scene_seed"] = args.scene_seed
+    return {"scene_params": scene_params}
 
 
 def cmd_recon(cfg: Config, args) -> int:
@@ -267,8 +306,10 @@ def cmd_recon(cfg: Config, args) -> int:
                   f"(also tried under {cfg.examples_dir})", file=sys.stderr)
             return 1
         src = resolved
+    task_obj = tasks.load(args.task)
     run_dir = pipeline.recon_example(cfg, src.resolve(), name=args.name,
-                                     options=_recon_options(args))
+                                     options=_recon_options(task_obj, args),
+                                     task_type=task_obj.name)
     return 0 if run_dir is not None else 1
 
 
@@ -289,14 +330,28 @@ def cmd_panel(cfg: Config, args) -> int:
 
 def cmd_solve(cfg: Config, args) -> int:
     run_dir = RUNS_DIR / args.name
-    tasks = task_dirs(run_dir)
-    if not tasks:
+    trial_dirs = task_dirs(run_dir)
+    if not trial_dirs:
         print(f"no built trial under {run_dir} — reconstruct it first "
               f"(studio recon ...)", file=sys.stderr)
         return 1
-    params = {k: getattr(args, k) for k in SOLVE_DEFAULTS
-              if getattr(args, k, None) is not None}
-    return 0 if pipeline.solve_tasks(cfg, run_dir, tasks, params) else 1
+    task_obj = tasks.load(manifest.read(run_dir).get("task_type")
+                          or tasks.DEFAULT)
+    box_params = {k: getattr(args, k) for k in SOLVE_DEFAULTS
+                  if getattr(args, k, None) is not None}
+    set_params = _parse_set(args.set, task_obj.solve_defaults,
+                            task_obj.name, "solve")
+    if task_obj.name == "box_carry":
+        params = {**box_params, **set_params}
+    else:
+        if box_params:
+            raise SystemExit(
+                f"{', '.join(sorted(box_params))}: box_carry-only solve "
+                f"flag(s); use --set key=value for {task_obj.name} params")
+        # config.yml task overrides ride along explicitly — the solve
+        # subprocess never reads config.yml itself
+        params = {**tasks.overrides(task_obj.name, "solve"), **set_params}
+    return 0 if pipeline.solve_tasks(cfg, run_dir, trial_dirs, params) else 1
 
 
 def cmd_view(cfg: Config, args) -> int:
@@ -321,14 +376,15 @@ def cmd_list(cfg: Config, args) -> int:
             prompt = " | ".join(prompt)
         rows.append((m.get("name", run_dir.name),
                      (m.get("created") or "")[:16],
+                     m.get("task_type") or tasks.DEFAULT,
                      m.get("verdict", "pending"),
                      (prompt or "")[:60]))
     if not rows:
         print("no runs yet")
         return 0
-    print(f"{'run':24s} {'created':16s} {'verdict':8s} prompt")
-    for name, created, verdict, prompt in rows:
-        print(f"{name:24s} {created:16s} {verdict:8s} {prompt}")
+    print(f"{'run':24s} {'created':16s} {'task':12s} {'verdict':8s} prompt")
+    for name, created, task, verdict, prompt in rows:
+        print(f"{name:24s} {created:16s} {task:12s} {verdict:8s} {prompt}")
     return 0
 
 
@@ -387,6 +443,8 @@ def main() -> None:
                                    "motion .npz (demo's Save Motion)")
     p.add_argument("example", help="example dir path / its name under the "
                                    "demo examples dir / a motion .npz file")
+    p.add_argument("--task", choices=tasks.names(), default=tasks.DEFAULT,
+                   help="downstream task (default: %(default)s)")
     p.set_defaults(func=cmd_run)
     p = sub.add_parser(
         "recon", help="scene reconstruction only (no solve): shim into "
@@ -395,6 +453,14 @@ def main() -> None:
     p.add_argument("source", help="motion .npz / example dir")
     p.add_argument("--name", default=None,
                    help="run name (default: derived from the source)")
+    p.add_argument("--task", choices=tasks.names(), default=tasks.DEFAULT,
+                   help="downstream task (default: %(default)s)")
+    p.add_argument("--scene-seed", type=int, default=None,
+                   help="obstacle-task scene randomization seed "
+                        "(jitter + yaw; default 0)")
+    p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                   help="task scene param override, repeatable (see the "
+                        "task's defaults, e.g. tasks/under_table_params.py)")
     for key, val in SCENE_DEFAULTS.items():
         flag = "--" + key.replace("_", "-")
         if isinstance(val, str):
@@ -410,13 +476,16 @@ def main() -> None:
     p.add_argument("--release-frame", type=int, default=None,
                    help="force the contact window end")
     p.set_defaults(func=cmd_recon)
-    p = sub.add_parser("solve", help="SBMPC solve for an already "
-                                     "reconstructed run")
+    p = sub.add_parser("solve", help="solve an already reconstructed run "
+                                     "(the run's task picks the solver)")
     p.add_argument("name", help="run name (see `studio list`)")
+    p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                   help="task solve param override, repeatable")
     for key, val in SOLVE_DEFAULTS.items():
         p.add_argument("--" + key.replace("_", "-"),
                        type=int if key in SOLVE_INT_KEYS else float,
-                       default=None, help=f"solve param (default: {val})")
+                       default=None,
+                       help=f"box_carry solve param (default: {val})")
     p.set_defaults(func=cmd_solve)
     p = sub.add_parser("panel", help="interactive viser panel: reconstruct + "
                                      "solve with tunable hyperparams")

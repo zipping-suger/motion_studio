@@ -51,6 +51,26 @@
 #   pos_rew_scale: 8.0     # object position — the objective
 #   joint_rew_scale: 0.5   # robot pose — a guide only
 
+# Per-task defaults overrides for the other downstream tasks (the scene:/
+# solve: sections above are the box_carry task's). Keys per task live in
+# src/studio/tasks/<task>_params.py; `--set key=value` overrides per run.
+# tasks:
+#   under_table:
+#     scene:
+#       yaw_range: 0.21        # table yaw sampled in +/- this (rad); 0 = off
+#       underside_drop: 0.04   # height difficulty knob
+#       max_ref_table_pen: 0.06  # closeness difficulty knob
+#     solve:
+#       num_samples: 2048      # parallel worlds; lower this if the GPU OOMs
+#     verify:
+#       max_pick_err: 0.15     # task preservation: pick hand vs reference
+#   kick:
+#     scene:
+#       max_ref_pen: 0.05      # closeness: reference foot sinks this deep
+#       box_width: 0.40
+#     verify:
+#       max_kick_err: 0.15     # task preservation: foot vs reference kick point
+
 # demo:
 #   model: Kimodo-G1-RP-v1
 #   port: 7860
