@@ -1,22 +1,20 @@
 """Kick-obstacle scene reconstruction: an obstacle in the swing path.
 
 The kick sibling of `table.py`: detect the kicking foot's swing from FK of
-the foot sites, place a floor-standing box (seeded position along the
-approach path, lateral/yaw jitter) so the REFERENCE swing penetrates it,
-and emit a trial the MPPI solve re-paths around — reference collides,
-augmented motion doesn't, and the kick point itself stays reachable.
+the foot sites, place a floor-standing box so the REFERENCE swing
+penetrates it, and emit a trial the MPPI solve re-paths around.
 
 Placement invariants, in priority order:
 
 1. the reference foot sinks ``max_ref_pen`` below the box top at the
-   chosen path point (the closeness knob — this is the solver's work);
-2. the kick point stays outside the box by ``kick_margin`` (else avoiding
-   the obstacle would forbid the kick itself) — the obstacle slides back
-   along the path until it does;
-3. everything that is NOT the kicking leg clears the box by
-   ``body_clearance`` — the box shifts across the path until it does
-   (same philosophy as the table task's arm_conflict: only the limb the
-   solver re-paths is allowed to conflict).
+   chosen path point — the closeness knob;
+2. the kick point stays outside the box by ``kick_margin``, else avoiding
+   the obstacle would forbid the kick itself; the box slides back along
+   the path until it does;
+3. everything that is NOT the kicking leg clears by ``body_clearance``;
+   the box shifts across the path until it does. Same philosophy as the
+   table task's arm_conflict: only the limb the solver re-paths may
+   conflict.
 
 numpy + mujoco only (studio's own venv); shares the robot model, SDF and
 FK utilities, injection, and trial emission with `table.py`.
@@ -32,12 +30,13 @@ from typing import Dict, Optional, Tuple
 import mujoco
 import numpy as np
 
+from . import layout
 from .table import (FOOT_GEOMS, _collision_geom_entries, _point_box_sdf_np,
                     emit_obstacle_trial, robot_model,
                     trajectory_collision_points)
 
-# geoms of each leg chain, by side — the kicking side's set is allowed to
-# conflict with the obstacle (re-pathing it is the solver's work)
+# leg-chain geoms by side; the kicking side's set may conflict with the
+# obstacle, since re-pathing it is the solver's work
 _LEG_KEYWORDS = ("hip", "thigh", "shin", "linkage")
 _SIDE_FOOT = {"left": ("lf0", "lf1", "lf2", "lf3"),
               "right": ("rf0", "rf1", "rf2", "rf3")}
@@ -70,6 +69,7 @@ def foot_site_trajectory(
     sids = [mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE, s)
             for s in ("left_foot", "right_foot")]
     assert -1 not in sids, "foot sites missing — build via robot_model()"
+    qpos_ref = layout.to_model(mj_model, qpos_ref)
     data = mujoco.MjData(mj_model)
     feet = np.zeros((len(qpos_ref), 2, 3))
     for t in range(len(qpos_ref)):
@@ -81,9 +81,9 @@ def foot_site_trajectory(
 
 
 def kick_leg_point_mask(mj_model: mujoco.MjModel, side: str) -> np.ndarray:
-    """Bool mask over trajectory_collision_points(..., FOOT_GEOMS) columns:
-    True = the point belongs to the ``side`` leg chain (incl. its foot
-    pads) — the limb allowed to conflict with the obstacle."""
+    """Bool mask over trajectory_collision_points(..., FOOT_GEOMS)
+    columns: True = the ``side`` leg chain and its foot pads, the limb
+    allowed to conflict with the obstacle."""
     mask = []
     for name, _, _, cap, _ in _collision_geom_entries(mj_model, FOOT_GEOMS):
         leg = (name.startswith(f"{side}_")
@@ -96,12 +96,11 @@ def kick_leg_point_mask(mj_model: mujoco.MjModel, side: str) -> np.ndarray:
 def detect_kick(feet: np.ndarray, lift_thresh: float):
     """(side, window (s0, s1), kick_frame) of the dominant swing.
 
-    side: 0 = left, 1 = right. The window is the contiguous run of frames
-    around the highest foot lift where the foot stays above the stance
-    height by lift_thresh; the kick frame is the window frame where the
-    foot is farthest from its window-start position (covers forward kicks
-    whose extreme point is not the apex). Raises ValueError when no frame
-    lifts — a verdict, not an error.
+    side: 0 = left, 1 = right. The window is the contiguous run around the
+    highest lift where the foot stays lift_thresh above stance height; the
+    kick frame is where the foot is farthest from its window start, which
+    also covers forward kicks whose extreme is not the apex. Raises
+    ValueError when no frame lifts — a verdict, not an error.
     """
     stance_z = np.median(feet[:10, :, 2], axis=0)          # (2,)
     lift = feet[:, :, 2] - stance_z[None, :]
@@ -181,8 +180,7 @@ def estimate_kick(
             foot[kick_frame][None], center, half, yaw)[0])
         return spec, body_clear, kick_clear
 
-    # slide the obstacle back along the approach until the kick point
-    # itself stays clear (invariant 2)
+    # invariant 2: slide back along the approach until the kick point clears
     n = kick_frame - s0
     idx = s0 + int(round(frac * n))
     while idx > s0 + 2:
@@ -190,8 +188,8 @@ def estimate_kick(
         if kick_clear >= kcfg.kick_margin:
             break
         idx -= 1
-    # shift across the path until the rest of the body clears (invariant
-    # 3), keeping the path point inside the footprint
+    # invariant 3: shift across the path until the rest of the body
+    # clears, keeping the path point inside the footprint
     max_shift = kcfg.box_width / 2 - 0.05
     best = None
     for k in range(int(max_shift / kcfg.clear_step) + 1):
@@ -254,8 +252,8 @@ def reconstruct(
     params: Dict,
 ) -> Tuple[Optional[Path], Optional[KickSpec], str]:
     """Full kick-obstacle reconstruction of one clip with resolved
-    ``params``. Returns (task_dir or None, spec or None, summary line) —
-    None means no kick was found, a verdict rather than an error."""
+    ``params`` -> (task_dir or None, spec or None, summary line). None
+    means no kick was found, a verdict rather than an error."""
     from .loader import load_kimodo_npz
 
     qpos, meta = load_kimodo_npz(npz_path)

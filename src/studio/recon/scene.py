@@ -1,19 +1,16 @@
 """SceneBot-style hindsight scene reconstruction (arXiv 2606.27581, Alg. 1
 Stage 3), generalized for arbitrary motion.
 
-From a robot-only kinematic motion + its scene-interaction graph,
-reconstructs:
+From a robot-only kinematic motion + its scene-interaction graph:
   - a box object (freejoint body) sized from the carry-phase hand gap,
-  - terrain plateaus: the support slab under the box plus one plateau per
-    elevated foot/pelvis contact (stairs, ledges, seats), merged when
-    overlapping at similar heights and CARVED where the robot's swept
-    lower body would collide (Alg. 1 line 27) — instead of skipping clips,
-  - the box reference trajectory (resting -> rigidly following the mid-hand
-    frame during carry),
+  - terrain plateaus: the support slab under the box plus one per
+    elevated foot/pelvis contact, merged when overlapping at similar
+    heights and CARVED where the robot's swept lower body would collide
+    (Alg. 1 line 27) rather than skipping the clip,
+  - the box reference trajectory,
   - per-link contact labels for all key links x {terrain, object},
-and emits a trial:
+emitted as a trial under
   {out_root}/processed/kimodo/unitree_g1/humanoid_object/{task}/
-      scene.xml, task_info.json, 0/trajectory_kinematic.npz
 """
 
 import json
@@ -26,7 +23,7 @@ import mujoco
 import numpy as np
 
 from ..config import SCENE_DEFAULTS
-from . import assets
+from . import assets, layout
 from .grasp import GraspInfo
 from .graph import (
     KEY_LINKS,
@@ -42,11 +39,10 @@ __all__ = ["SCENE_DEFAULTS", "BoxSpec", "Plateau", "SceneSpec", "emit_trial",
            "reconstruct_terrain", "measure_spawn_penetration"]
 
 # --- box placement optimization ---------------------------------------------
-# The rest pose is read off noisy hands at a single frame, so the box (and the
-# support slab beneath it) can land inside the robot's spawn pose or pre-pick
-# path; MuJoCo resolves such penetration violently at settle. A bounded
-# kinematic grid search over (dx, dy, dyaw) clears the robot's pre-pick sweep
-# out of the box's rest column at scene-build time — no dynamics in the loop.
+# The rest pose is read off noisy hands at one frame, so the box and its slab
+# can land inside the robot's spawn pose or pre-pick path, which MuJoCo
+# resolves violently at settle. A bounded kinematic grid search over
+# (dx, dy, dyaw) clears the pre-pick sweep out of the rest column.
 PLACE_SEARCH_XY = 0.12    # m: placement search half-range per axis
 PLACE_STEP_XY = 0.03
 PLACE_SEARCH_YAW = 0.3    # rad
@@ -58,19 +54,17 @@ PLACE_MAX_PEN_OK = 0.005  # m: residual true penetration above this -> flag
 HAND_ENGAGE_FRAMES = 15   # hands may close on the box this long before pick
 HAND_KPS = (22, 23, 24, 25, 30, 31, 32, 33)  # kimodo wrist/hand keypoints
 BLEND_FRAMES = 12         # frames to decay the shift back onto the carry track
-# Arm keypoints (j18+) legitimately dwell AT the box faces pre-pick — the box
-# is literally defined by the hands — so proximity must not read as
-# penetration: small radius (the hand keypoint sits ~0.048 m outside the grip
-# face, the palm capsule is r~0.04) plus a tolerance deadzone, so only stabs
-# well into the box interior count. Body keypoints (j0-j17: legs, waist) keep
-# the strict radius + buffer — they are the actual spawn-collision failure.
+# Arm keypoints (j18+) legitimately dwell AT the box faces pre-pick — the
+# box is defined by the hands — so they get a small radius plus a deadzone
+# and only stabs well inside count. Body keypoints (j0-j17) keep the strict
+# radius: they are the actual spawn-collision failure.
 ARM_KP_START = 18
 ARM_R = 0.04              # m: arm/hand keypoint radius (G1 palm capsule r)
 ARM_TOL = 0.01            # m: arms may skim the faces; deeper than this counts
 
 # --- terrain reconstruction (Alg. 1 Stage 3) --------------------------------
-# Carving grid + the lower-body keypoints (kimodo j0-j17 — hands legitimately
-# reach over the support slab) whose swept volume notches the terrain.
+# Carving grid + the lower-body keypoints (j0-j17; hands legitimately reach
+# over the support slab) whose swept volume notches the terrain.
 CELL = 0.06            # m: carve-grid resolution
 LINK_R = 0.08          # m: keypoint clearance radius
 PLATEAU_HALF = 0.15    # m: initial square plateau per terrain edge
@@ -121,7 +115,6 @@ class SceneSpec:
     table_half: np.ndarray        # (3,)
     table_yaw: float              # slab is yaw-aligned with the box
     has_table: bool
-    # post-carve terrain; None means "derive from the legacy table fields"
     plateaus: Optional[List[Plateau]] = None
     flags: List[str] = field(default_factory=list)
     placement: Optional[Dict] = None  # box placement optimization stats
@@ -143,16 +136,13 @@ def optimize_box_placement(
 ) -> Tuple[np.ndarray, float, Dict]:
     """Nudge the box rest pose so the robot never sweeps its rest volume.
 
-    Penetration is keypoint-sphere vs the yaw-aligned box footprint over the
-    z band [z_lo, top_z] — the box body plus the support slab directly
-    beneath it (NOT a full floor column: feet standing under a floating
-    table slab are legitimate), over all pre-pick frames. Clearing the band
-    both fixes spawn-in-collision and keeps the slab's protected support
-    cell sweep-free (the carve skip condition). Arm keypoints get a small
-    radius plus the ARM_TOL deadzone (legitimate face proximity is not
-    penetration) and hands are fully exempt in the last HAND_ENGAGE_FRAMES
-    before the pick. Returns (dxy, dyaw, stats); zero shift when the
-    nominal placement is already clear.
+    Penetration is keypoint-sphere vs the yaw-aligned box footprint over
+    the z band [z_lo, top_z] — box plus the slab directly beneath it, not
+    a full floor column, since feet under a floating slab are legitimate
+    — across all pre-pick frames. Clearing the band fixes spawn-in-
+    collision and keeps the protected support cell sweep-free. Arm
+    keypoints get the ARM_TOL deadzone and hands are exempt in the last
+    HAND_ENGAGE_FRAMES. Returns (dxy, dyaw, stats).
     """
     stats = {"max_pen_before": 0.0, "max_pen_after": 0.0, "checked_pts": 0}
     if pick <= 0:
@@ -239,16 +229,12 @@ def build_object_trajectory(
     mid = np.stack([smooth(mid[:, i], 5) for i in range(3)], axis=1)
     hand_axis = lh - rh
     yaw = np.unwrap(np.arctan2(hand_axis[:, 1], hand_axis[:, 0]))
-    # box x-axis along the hand line -> box faces normal to the hands
-    yaw = smooth(yaw, 9)
+    yaw = smooth(yaw, 9)   # box x along the hand line: faces meet the hands
 
     if grasp.starts_held:
-        # Clip begins mid-hold: there is no rest phase, so no rest pose to
-        # infer and no support to build under the start — the box simply
-        # rides the hand midpoint from frame 0 (same rule as the carry
-        # phase below). Placement search is moot (nothing pre-pick to
-        # clear); a release before the end leaves the box wherever the
-        # hands set it, flagged when that is not on the floor.
+        # mid-hold start: no rest phase to infer and nothing pre-pick to
+        # clear, so the box just rides the hand midpoint from frame 0.
+        # An early release leaves it wherever the hands set it.
         half_w = (grasp.box_width + squeeze) / 2
         obj = np.zeros((T, 7))
         for t in range(T):
@@ -280,21 +266,19 @@ def build_object_trajectory(
     rest_yaw = float(yaw[pick])
     half_h = box_height / 2
     table_top = rest_pos[2] - half_h
-    # Floor snap (interaction-first): rather than reconstructing a thin
-    # floating slab under a low pick, extend the box down to the floor so it
-    # rests naturally and the palms grip at its centroid (torque-free lift).
+    # floor snap: rather than a thin floating slab under a low pick,
+    # extend the box to the floor so the palms grip at its centroid
     scene_flags = []
     if table_top < floor_snap_below:
         half_h = float(np.clip(rest_pos[2], 0.08, 0.35))
         rest_pos[2] = max(rest_pos[2], half_h)   # bottom on the floor
         if rest_pos[2] - half_h > 0.01:
-            # rest pose too high even for the tallest snap box: the box
-            # hangs above the floor and will drop at settle
+            # too high even for the tallest snap box: it will drop at settle
             scene_flags.append("box_floats")
         table_top = 0.0
     has_table = table_top > 0.03
-    # squeeze widens the box past the hand gap so the reference hand poses
-    # press into the faces, biasing rollouts toward a firm grip
+    # squeeze widens the box past the hand gap, so the reference palms
+    # press into the faces and rollouts bias toward a firm grip
     half_w = (grasp.box_width + squeeze) / 2
     half_d = box_depth / 2
 
@@ -308,9 +292,8 @@ def build_object_trajectory(
     if place_stats["max_pen_after"] > PLACE_MAX_PEN_OK:
         scene_flags.append("spawn_clearance_unresolved")
 
-    # Post-pick the reference rejoins the raw mid-hand track: the placement
-    # shift (and any floor-snap z change) decays over BLEND_FRAMES so the
-    # reference is continuous at the pick instead of jumping.
+    # post-pick the reference rejoins the raw mid-hand track: the shift
+    # decays over BLEND_FRAMES so the pick is continuous, not a jump
     offset = rest_pos - mid[pick]
     obj = np.zeros((T, 7))
     for t in range(T):
@@ -323,13 +306,11 @@ def build_object_trajectory(
             obj[t, 3:] = yaw_quat_wxyz(float(yaw[t]) + w * dyaw)
         else:
             obj[t] = obj[t - 1]
-    # Floating slab (no legs/column): the reference motions are not
-    # scene-aware, so a full-height table would occupy the space the robot's
-    # legs sweep through (SceneBot carves such regions out for the same
-    # reason). The slab is static, so it needs no support. It is cut to the
-    # box footprint and yaw-aligned with the box — an axis-aligned or larger
-    # slab lets a rotated box overhang (tipping/bouncing) and reaches into
-    # the robot's standing space.
+    # Floating slab, no legs: the reference motions are not scene-aware,
+    # so a full-height table would occupy space the legs sweep through
+    # (SceneBot carves such regions for the same reason), and it is static
+    # anyway. Cut to the box footprint and yaw-aligned, since a larger or
+    # axis-aligned slab lets a rotated box overhang and tip.
     slab_half = min(0.02, table_top / 2)
     table_half = np.array(
         [half_w + table_margin, half_d + table_margin, slab_half]
@@ -358,9 +339,8 @@ def generate_scene_xml(spec: SceneSpec, hand_geom: str = "capsule") -> str:
     """Template surgery on the omomo move_largebox scene: swap the box,
     absolutize meshdir, add the table geom + contact pairs.
 
-    hand_geom: "capsule" (fitted to the rubber-hand mesh, rounded, robust)
-               or "mesh" (convex hull of the rubber-hand mesh itself, most
-               faithful — the OmniRetarget approach)."""
+    hand_geom: "capsule" (fitted to the rubber-hand mesh, rounded) or
+    "mesh" (its convex hull — the OmniRetarget approach)."""
     xml = assets.robot_xml()   # template, meshdir already absolutized
 
     b = spec.box
@@ -382,10 +362,8 @@ def generate_scene_xml(spec: SceneSpec, hand_geom: str = "capsule") -> str:
     xml, n = re.subn(r'<body name="largebox".*?</body>', box_body, xml, flags=re.S)
     assert n == 1, "largebox body not found in template"
 
-    # The template ships body collision geoms commented out (menagerie-MJX
-    # lineage). Enable the ones the box can plausibly hit and pair them with
-    # it, so the box cannot pass through the head, torso, or legs — and so
-    # arm/chest hugging transmits real force (allowed and encouraged).
+    # the template ships body collision geoms commented out (menagerie-MJX
+    # lineage); enable the ones the box can plausibly hit and pair them
     body_geoms = [
         "pelvis_collision",
         "left_hip_collision", "right_hip_collision",
@@ -394,7 +372,7 @@ def generate_scene_xml(spec: SceneSpec, hand_geom: str = "capsule") -> str:
         "torso_collision", "head_collision",
     ]
     # arm segments get grip-level friction + stiffness: hugging is a
-    # legitimate carry strategy, not just an obstacle
+    # legitimate carry strategy, not an obstacle
     arm_geoms = [
         "left_shoulder_yaw_collision", "right_shoulder_yaw_collision",
         "left_elbow_yaw_collision", "right_elbow_yaw_collision",
@@ -407,7 +385,9 @@ def generate_scene_xml(spec: SceneSpec, hand_geom: str = "capsule") -> str:
         xml, n = re.subn(
             rf'<!--\s*(<geom name="{lead}".*?)\s*-->', r"\1", xml, flags=re.S
         )
-        assert n == 1, f"commented collision geom block {lead} not found"
+        # thigh/wrist ship ACTIVE (they partner the ghost self-pairs)
+        assert n == 1 or f'<geom name="{lead}"' in xml, \
+            f"collision geom {lead} not found"
     # the collision default class is sphere; fromto-based geoms are capsules
     xml = re.sub(r'(<geom name="[a-z_]*collision" class="collision")(?![^>]*type=)',
                  r'\1 type="capsule"', xml)
@@ -424,52 +404,39 @@ def generate_scene_xml(spec: SceneSpec, hand_geom: str = "capsule") -> str:
     xml = xml.replace("<!-- hand-object contact -->",
                       body_pairs + "<!-- hand-object contact -->")
 
-    # more contact pairs need larger collision buffers in mujoco_warp
-    xml = xml.replace('<numeric data="15" name="max_contact_points" />',
-                      '<numeric data="40" name="max_contact_points" />')
-    xml = xml.replace('<numeric data="15" name="max_geom_pairs" />',
-                      '<numeric data="40" name="max_geom_pairs" />')
+    # replace the crude r=0.05 hand spheres with geometry fitted to the
+    # rubber-hand visual mesh. The BrainCo template ships mesh-fitted palm
+    # boxes and finger capsules already, so there is nothing to replace.
+    if '<geom name="lh" class="hand_collision" />' in xml:
+        for name, side, ysign in (("lh", "left", -1), ("rh", "right", 1)):
+            if hand_geom == "mesh":
+                # convex hull of the visual mesh; the mount offset matches
+                # the visual geom (+y left, -y right)
+                hand = (
+                    f'<geom name="{name}" class="collision" type="mesh" '
+                    f'mesh="{side}_rubber_hand" '
+                    f'pos="0.0415 {-ysign * 0.003:.3f} 0" />'
+                )
+            else:
+                # along the palm axis, rounded ends so it cannot dig in.
+                # The grasp face sits at |y| ~= 0.048 in the wrist_yaw
+                # frame, near the mesh's own 0.045 palm surface.
+                y = ysign * 0.008
+                hand = (
+                    f'<geom name="{name}" class="collision" type="capsule" '
+                    f'size="0.04" '
+                    f'fromto="0.065 {y:.3f} 0.01 0.155 {y:.3f} 0.01" />'
+                )
+            xml, n = re.subn(rf'<geom name="{name}" class="hand_collision" />',
+                             hand, xml)
+            assert n == 1, f"hand geom {name} not found"
 
-    # Replace the crude r=0.05 hand spheres with geometry fitted to the
-    # rubber-hand visual mesh, so collision matches what the viewer shows.
-    for name, side, ysign in (("lh", "left", -1), ("rh", "right", 1)):
-        if hand_geom == "mesh":
-            # convex hull of the visual mesh (auto-convexified by MuJoCo);
-            # mount offset matches the visual geom (+y for left, -y for right)
-            hand = (
-                f'<geom name="{name}" class="collision" type="mesh" '
-                f'mesh="{side}_rubber_hand" '
-                f'pos="0.0415 {-ysign * 0.003:.3f} 0" />'
-            )
-        else:
-            # capsule along the palm axis; rounded ends don't dig into the
-            # box. Palm grasp face sits at |y| ~= 0.048 in the wrist_yaw
-            # frame, close to the mesh's 0.045 palm surface.
-            y = ysign * 0.008
-            hand = (
-                f'<geom name="{name}" class="collision" type="capsule" '
-                f'size="0.04" '
-                f'fromto="0.065 {y:.3f} 0.01 0.155 {y:.3f} 0.01" />'
-            )
-        xml, n = re.subn(rf'<geom name="{name}" class="hand_collision" />',
-                         hand, xml)
-        assert n == 1, f"hand geom {name} not found"
-
-    # firmer grip and stiffer contact than the template default, so the
-    # squeeze force develops at millimeter- rather than centimeter-scale depth
-    for pair in ("left_hand_object", "right_hand_object"):
-        xml, n = re.subn(
-            rf'(<pair name="{pair}"[^>]*)solref="0.008 1"([^>]*)friction="1 1"',
-            r'\g<1>solref="0.004 1" solimp="0.95 0.99 0.001"\g<2>friction="2 2"',
-            xml,
-        )
-        assert n == 1, f"pair {pair} not found"
+    xml = harden_hand_object_pairs(xml)
 
     # --- terrain plateaus (Alg. 1 Stage 3) -----------------------------
-    # Contact partners by kind (explicit-pair-only scene): the box and
-    # hands touch supports; feet step on terrain; the pelvis/thighs rest
-    # on seats. The first support rectangle keeps the name "table" — the
-    # viewers and export_dataset.py regex-parse that geom.
+    # contact partners by kind (explicit-pair-only scene). The first
+    # support rectangle keeps the name "table": the viewers and
+    # export_dataset.py regex-parse that geom.
     plateaus = spec.plateaus
     if plateaus is None:
         plateaus = [Plateau(spec.table_center, spec.table_half,
@@ -512,15 +479,45 @@ def generate_scene_xml(spec: SceneSpec, hand_geom: str = "capsule") -> str:
         xml = xml.replace("<!-- hand-object contact -->",
                           "\n    ".join(pair_lines)
                           + "\n    <!-- hand-object contact -->")
-    # mujoco_warp needs collision buffers sized to the pair count; 40
-    # covers the legacy single-slab scene (<= 3 plateau pairs) exactly
-    cap = max(40, 37 + len(pair_lines))
-    if cap > 40:
-        xml = xml.replace('<numeric data="40" name="max_contact_points" />',
-                          f'<numeric data="{cap}" name="max_contact_points" />')
-        xml = xml.replace('<numeric data="40" name="max_geom_pairs" />',
-                          f'<numeric data="{cap}" name="max_geom_pairs" />')
+    return size_contact_buffers(xml)
+
+
+def harden_hand_object_pairs(xml: str) -> str:
+    """Firmer grip and stiffer contact than the template default, so the
+    squeeze force develops at millimetre- rather than centimetre-scale
+    depth. Covers lh/rh plus the BrainCo template's 20 finger pairs.
+
+    The solref timeconst must respect MuJoCo's stability bound of
+    2 * timestep at the solve's 60 Hz step: below it the contact is not
+    stiffer but unrealizable, and servo-squeezed fingers sank 20-37 mm
+    into the object at solref 0.004.
+
+    condim 4 adds torsional friction about the normal — capsule fingers
+    touch a handle along a line, and without it a gripped pole spins
+    freely. The torsional coefficient has length units, ~ mu times the
+    pad radius. Sliding mu is 1.5 (rubber pad on plastic) rather than the
+    2.0 it once was, since torsion now carries the twist load."""
+    xml, n = re.subn(
+        r'(<pair name="(?:left|right)_hand\w*_object"[^>]*)'
+        r'solref="0.008 1"([^>]*)friction="1 1" condim="3"',
+        r'\g<1>solref="0.04 1" solimp="0.95 0.99 0.001"\g<2>'
+        r'friction="1.5 1.5 0.008" condim="4"',
+        xml,
+    )
+    assert n in (2, 22), f"expected 2 or 22 hand-object pairs, patched {n}"
     return xml
+
+
+def size_contact_buffers(xml: str) -> str:
+    """mujoco_warp needs collision buffers sized to the final pair count;
+    a single pair can yield several contact points. Call last."""
+    npair = xml.count("<pair ")
+    xml = re.sub(r'<numeric data="\d+" name="max_geom_pairs" />',
+                 f'<numeric data="{max(40, npair + 3)}" '
+                 'name="max_geom_pairs" />', xml)
+    return re.sub(r'<numeric data="\d+" name="max_contact_points" />',
+                  f'<numeric data="{max(40, 2 * npair)}" '
+                  'name="max_contact_points" />', xml)
 
 
 def _mask_to_rects(mask: np.ndarray) -> List[Tuple[int, int, int, int]]:
@@ -562,14 +559,14 @@ def _carve_plateau(
     """Notch a plateau where the robot sweeps through it (Alg. 1 line 27).
 
     jp_lower: (T, K, 3) keypoints whose sweep carves; exempt: (T, K) True
-    where a keypoint's contact with this plateau is legitimate (planted
-    foot / seated pelvis). protect_xy: world xy that must stay supported
-    while the box rests there (frames <= protect_end, i.e. until the
-    pick). A sweep through that cell during the rest phase means the
-    motion is inconsistent with any support here: returns None (skip the
-    clip). Later sweeps neither skip nor carve the cell — it must persist
-    to hold the box at t=0, and the scene uses explicit contact pairs, so
-    legs never collide with supports in simulation anyway.
+    where a keypoint's contact is legitimate (planted foot, seated
+    pelvis). protect_xy: world xy that must stay supported until
+    protect_end. A sweep through that cell during the rest phase means
+    the motion admits no support here, so the clip is skipped (None);
+    later sweeps neither skip nor carve it — the cell must persist to
+    hold the box at t=0, and explicit contact pairs keep legs from
+    colliding with supports anyway.
+
     Returns (rect plateaus, carved cell count, surviving area fraction).
     """
     cy, sy = np.cos(plat.yaw), np.sin(plat.yaw)
@@ -634,20 +631,18 @@ def _carve_plateau(
 def reconstruct_terrain(
     meta: Dict, graph: InteractionGraph, spec: SceneSpec
 ) -> Optional[Tuple[List[Plateau], Dict]]:
-    """Alg. 1 Stage 3 terrain: plateau per terrain edge, merge similar
-    heights, carve robot-collision regions. The box support slab from the
-    object reconstruction joins as a carvable "support" plateau whose CoM
-    cell is protected. Returns (plateaus, stats), or None when the robot
-    sweeps through the box's own resting spot (motion-scene inconsistent,
-    clip must be skipped)."""
+    """Alg. 1 Stage 3 terrain: a plateau per terrain edge, merged at
+    similar heights, carved where the robot collides. The box support
+    slab joins as a carvable "support" plateau with its CoM cell
+    protected. Returns (plateaus, stats), or None when the robot sweeps
+    through the box's own resting spot and the clip must be skipped."""
     jp_lower = meta["joint_positions"][:, :18]
     T = len(jp_lower)
     plateaus: List[Plateau] = []
     stats = {"carved_cells": 0, "support_area_frac": 1.0}
 
     if spec.has_table:
-        # the box occupies its support until the pick; without a grasp it
-        # rests there for the whole clip
+        # the box occupies its support until the pick, or the whole clip
         obj_edges = [e for e in graph.edges if e.scene == "object"]
         protect_end = min(e.start for e in obj_edges) if obj_edges else T - 1
         support = Plateau(center=spec.table_center.copy(),
@@ -734,8 +729,8 @@ def measure_spawn_penetration(
     model: mujoco.MjModel, data: mujoco.MjData
 ) -> Dict[str, float]:
     """Signed-distance check of every robot collision geom against the box
-    and terrain geoms at the current state (call mj_forward first). Returns
-    {"<robot_geom>~<scene_geom>": depth} for penetrations beyond tolerance."""
+    and terrain geoms at the current state (mj_forward first) ->
+    {"<robot_geom>~<scene_geom>": depth} beyond tolerance."""
     names = [
         mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or ""
         for g in range(model.ngeom)
@@ -765,10 +760,10 @@ def emit_trial(
     hand_geom: str = "capsule",
     **traj_kwargs,
 ) -> Optional[Path]:
-    """Write a complete trial. Returns the trial dir, or None if the
-    motion is inconsistent with any scene: the robot sweeps through the
-    box's resting support (carving cannot fix it), or frame 0 still spawns
-    the robot > SPAWN_SKIP_PEN inside the scene after placement search."""
+    """Write a complete trial. Returns the trial dir, or None when the
+    motion admits no scene: the robot sweeps through the box's resting
+    support, or frame 0 still spawns it > SPAWN_SKIP_PEN inside the scene
+    after the placement search."""
     obj_qpos, spec = build_object_trajectory(meta, grasp, **traj_kwargs)
     graph = build_interaction_graph(meta, grasp)
     terr = reconstruct_terrain(meta, graph, spec)
@@ -778,25 +773,28 @@ def emit_trial(
 
     scene_xml = generate_scene_xml(spec, hand_geom=hand_geom)
     model = mujoco.MjModel.from_xml_string(scene_xml)
-    assert model.nq == 43 and model.nv == 41, (model.nq, model.nv)
+    layout.check_scene(model)
 
-    qpos = np.concatenate([qpos_robot, obj_qpos], axis=1)
+    # model layout: base + body joints at their addresses (hand joints
+    # rest at 0), box free joint last
+    qpos = np.zeros((len(qpos_robot), model.nq))
+    qpos[:, :7] = qpos_robot[:, :7]
+    qpos[:, layout.body_addr(model)] = qpos_robot[:, 7:]
+    qpos[:, -7:] = obj_qpos
     fps = meta["fps"]
 
-    # Exact spawn check on the real collision geoms. Geometric, NOT via
-    # data.contact: the scene is explicit-pair-only, so e.g. a shin through
-    # the support slab produces no MuJoCo contact — but it is still a broken
-    # scene (visually, and a hard collision after Isaac export). The
-    # placement search uses keypoint spheres; this measures the residual —
-    # and vetoes the clip when even the optimized placement spawns the robot
-    # deep inside the scene (nothing downstream can fix that).
+    # Geometric, NOT via data.contact: the scene is explicit-pair-only, so
+    # a shin through the support slab produces no MuJoCo contact while
+    # still being a broken scene. The placement search worked in keypoint
+    # spheres; this measures the residual and vetoes the clip when even
+    # the optimized placement spawns the robot deep inside.
     data = mujoco.MjData(model)
     data.qpos[:] = qpos[0]
     mujoco.mj_forward(model, data)
     spawn_pen = measure_spawn_penetration(model, data)
     if grasp.starts_held:
-        # holding at spawn = palm-vs-box contact by design (squeeze biases
-        # the reference INTO the faces); only non-hand penetrations veto
+        # holding at spawn means palm-vs-box contact by design, so only
+        # non-hand penetrations veto
         hard_pen = {k: v for k, v in spawn_pen.items()
                     if not (k.split("~")[0] in HAND_SPAWN_GEOMS
                             and k.endswith("~largebox_geom"))}
@@ -816,17 +814,17 @@ def emit_trial(
     (task_dir / "scene.xml").write_text(scene_xml)
 
     qvel = compute_qvel(model, qpos, 1.0 / fps)
-    ctrl = qpos[:, 7:36].copy()
+    ctrl = layout.ctrl_reference(model, qpos)
 
-    # Grasp-contact reference for the solver's contact reward: during the
-    # grasp window, pull the palm sites onto the box side-face centers. This
-    # rewards firmly holding the box directly, independent of pose mimicry.
+    # contact reference for the solver: over the grasp window, pull the
+    # palm sites onto the box side-face centers, so holding the box is
+    # rewarded directly rather than through pose mimicry
     T = len(qpos)
     contact = np.zeros((T, 2))
     contact_pos = np.zeros((T, 2, 3))
     contact[grasp.pick_frame:grasp.release_frame + 1] = 1.0
     for t in range(T):
-        box_p, box_q = qpos[t, 36:39], qpos[t, 39:43]
+        box_p, box_q = qpos[t, -7:-4], qpos[t, -4:]
         yaw = 2 * np.arctan2(box_q[3], box_q[0])
         face = np.array([np.cos(yaw), np.sin(yaw), 0.0]) * spec.box.half_w
         contact_pos[t, 0] = box_p + face   # left palm (+x_box side)
@@ -846,6 +844,7 @@ def emit_trial(
         link_pos=graph.link_pos.astype(np.float32),
     )
     info = {
+        "task_type": "box_carry",
         "ref_dt": 1.0 / fps,
         "contact_site_ids": site_ids,
         "source_npz": meta["file_path"],

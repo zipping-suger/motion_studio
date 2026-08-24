@@ -21,3 +21,9 @@ assets/g1/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# local only: tests and the doc-render machinery
+tests/
+scripts/render_*.py
+docs/root_paths/
+docs/pole_objects/

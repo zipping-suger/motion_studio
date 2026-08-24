@@ -201,7 +201,9 @@ def load_kimodo_npz(
     """Load a Kimodo NPZ and convert to MuJoCo G1 qpos.
 
     Returns:
-        qpos:     (T, 36) float64 — pelvis pos(3) + quat wxyz(4) + 29 joints.
+        qpos:     (T, 36) float64 — pelvis pos(3) + quat wxyz(4) + 29 joints,
+                  the *body contract* (see studio.recon.layout): contiguous
+                  DOF_NAMES order, independent of the active robot model.
         metadata: dict with fps, n_frames, dof_names, foot_contacts (T,4),
                   joint_positions (T,34,3) in MuJoCo coords,
                   global_root_heading, file_path.

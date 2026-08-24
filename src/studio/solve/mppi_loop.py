@@ -4,17 +4,13 @@ Runs inside the solve venv, like its box-carry sibling `loop.py`:
 
     python -m studio.solve.mppi_loop --task-dir T [--param k=v ...]
 
-where T is an under-table trial dir (scene.xml + task_info.json +
-0/trajectory_kinematic.npz, see recon.table.emit_trial). Ported from the
-mppi_obstacle experiment's mppi_solver.py (itself derived from
-spider/examples/tutorial_collision_free_aug.ipynb).
+where T is an under-table trial dir (see recon.table.emit_trial).
 
 Differences from `loop.py`: the embodiment is ``humanoid`` (the table is
-static terrain, not a tracked object), the reward is replaced wholesale by
-`obstacle_rewards`, there is no domain randomization, and diverged samples
-are killed and resampled during rollout (terminate_resample). The result is
-written as 0/trajectory_aug.npz; verification runs studio-side
-(tasks.under_table), so this file stays solver-only.
+static terrain, not a tracked object), `obstacle_rewards` replaces the
+reward wholesale, there is no domain randomization, and diverged samples
+are resampled during rollout. Writes 0/trajectory_aug.npz; verification
+runs studio-side in tasks.under_table.
 """
 
 from __future__ import annotations
@@ -33,19 +29,19 @@ from spider.io import load_data
 from spider.optimizers.sampling import (
     make_optimize_fn,
     make_optimize_once_fn,
-    make_rollout_fn,
 )
 from spider.simulators import mjwp
 
 from ..tasks import kick_params, under_table_params
 from ..tasks.under_table_params import coerce
 from . import obstacle_rewards as rw
+from .rollout import make_rollout_fn, skip_zero_perturbation
 
 RESULT_NPZ = "trajectory_aug.npz"
 CONFIG_JSON = "solve_config.json"
 
-# per-task tunables: the trial's task_info.json names its task, which
-# selects the solve defaults --param overrides are resolved against
+# the trial's task_info.json names its task, which selects the solve
+# defaults --param overrides resolve against
 TASK_PARAMS = {
     "under_table": under_table_params.SOLVE_DEFAULTS,
     "kick": kick_params.SOLVE_DEFAULTS,
@@ -75,8 +71,8 @@ def resolve_params(cli_params: dict, task_type: str) -> dict:
 
 def build_spider_config(params: dict, scene_xml: Path, traj_npz: Path,
                         ref_dt: float, n_frames: int, task: str) -> Config:
-    """A spider Config for the injected G1 table scene — set directly, no
-    hydra and no process_config (the dataset layout is ours, not spider's)."""
+    """A spider Config for the injected G1 table scene, set directly: no
+    hydra, no process_config (the dataset layout is ours, not spider's)."""
     mj_model = mujoco.MjModel.from_xml_path(str(scene_xml))
 
     config = Config(
@@ -111,12 +107,12 @@ def build_spider_config(params: dict, scene_xml: Path, traj_npz: Path,
     config.final_noise_scale = params["final_noise_scale"]
     config.joint_noise_scale = params["joint_noise_scale"]
 
-    # Reward scales consumed by spider internals (tracking weights come
-    # from obstacle_rewards, not from these)
+    # consumed by spider internals; tracking weights come from
+    # obstacle_rewards, not from these
     config.vel_rew_scale = params["vel_rew_scale"]
     config.contact_rew_scale = 0.0
 
-    # Termination resampling — kill & replace diverged samples during rollout
+    # kill & replace diverged samples during rollout
     config.terminate_resample = params["terminate_resample"]
     config.base_pos_threshold = params["base_pos_threshold"]
     config.base_rot_threshold = params["base_rot_threshold"]
@@ -135,10 +131,8 @@ def build_spider_config(params: dict, scene_xml: Path, traj_npz: Path,
     compute_steps(config)
     compute_noise_schedule(config)
 
-    # Damp exploration noise on the leg actuators: spider scales noise
-    # uniformly across joints, but leg noise perturbs balance in every
-    # rollout while the arms are the ones that need to explore around the
-    # table. (noise_scale sample 0 stays zero — scaling preserves it.)
+    # spider scales noise uniformly across joints, but leg noise perturbs
+    # balance in every rollout while only the arms need to explore
     if params["leg_noise_scale"] != 1.0:
         leg_kw = ("hip", "knee", "ankle")
         leg_ids = [
@@ -151,8 +145,21 @@ def build_spider_config(params: dict, scene_xml: Path, traj_npz: Path,
             f"expected 12 G1 leg actuators, found {len(leg_ids)}")
         config.noise_scale[:, :, leg_ids] *= params["leg_noise_scale"]
 
-    # Solve through the whole motion: load_data pads the reference with
-    # horizon + ctrl steps of repeated last frames for exactly this.
+    # at the default hand_noise_scale=0 the fingers track the rest pose
+    # exactly, so the extra 12 action dims cost no exploration
+    if params["hand_noise_scale"] != 1.0:
+        hand_kw = ("thumb", "index", "middle", "ring", "pinky")
+        hand_ids = [
+            i for i in range(mj_model.nu)
+            if any(k in (mujoco.mj_id2name(
+                mj_model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) or "")
+                for k in hand_kw)
+        ]
+        if hand_ids:
+            config.noise_scale[:, :, hand_ids] *= params["hand_noise_scale"]
+
+    # solve through the whole motion; load_data pads the reference with
+    # horizon + ctrl steps of repeated last frames for exactly this
     config.max_sim_steps = int(n_frames * (config.ref_dt / config.sim_dt))
     return config
 
@@ -182,7 +189,7 @@ def solve(task_dir: Path, cli_params: dict) -> dict:
     ]
     obstacles = rw.ObstacleSet(info["primitives"])
     get_reward, get_terminal_reward = rw.make_reward_fns(
-        params, robot_geoms, obstacles, obstacle_ids)
+        params, mj_model_scene, robot_geoms, obstacles, obstacle_ids)
 
     ref_data = load_data(config, config.data_path)
     qpos_ref_t, qvel_ref_t, ctrl_ref_t = ref_data[:3]
@@ -198,20 +205,16 @@ def solve(task_dir: Path, cli_params: dict) -> dict:
     mujoco.mj_step(mj_model, mj_data)
     mj_data.time = 0.0
 
-    config.trace_site_ids = [
-        sid for sid in range(mj_model.nsite)
-        if (mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_SITE, sid) or ""
-            ).startswith("trace")
-    ]
     # No domain randomization
     config.env_params_list = [
         [{"xy_offset": 0.0, "pair_margin": 0.0}]
         for _ in range(config.max_num_iterations)
     ]
 
+    skip_zero_perturbation(config)
     rollout = make_rollout_fn(
         mjwp.step_env, mjwp.save_state, mjwp.load_state,
-        get_reward, get_terminal_reward, mjwp.get_terminate, mjwp.get_trace,
+        get_reward, get_terminal_reward, rw.get_terminate,
         mjwp.save_env_params, mjwp.load_env_params, mjwp.copy_sample_state,
     )
     optimize = make_optimize_fn(make_optimize_once_fn(rollout))

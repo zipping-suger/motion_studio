@@ -1,9 +1,8 @@
 """The downstream-task interface.
 
-A Task bundles the five things that vary between downstream tasks — how a
-clip becomes a scene, how the scene is solved, and how the result is judged
-— so `pipeline` and the CLI stay task-agnostic. Everything else (shim,
-manifest, run layout, subprocess mechanics, venv split) is shared.
+A Task bundles what varies between downstream tasks — how a clip becomes
+a scene, how it is solved, how the result is judged — so `pipeline` and
+the CLI stay task-agnostic. Everything else is shared.
 """
 
 from __future__ import annotations
@@ -25,13 +24,13 @@ class Task:
     solve_defaults: dict
     solve_int_keys: frozenset
     # (npz, out_root, task_name, options) -> (task_dir | None, summary line)
-    # None task_dir = the motion is inconsistent with the task's scene family
-    # (a verdict); raise for real errors.
+    # None task_dir = the motion admits no scene of this family (a
+    # verdict); raise for real errors.
     reconstruct: Callable
     # (cfg, task_name, dataset_dir, params) -> subprocess argv for one solve
     solve_command: Callable
-    # (task_dirs) -> [(task_name, metrics dict | None)]; numpy/mujoco only —
-    # verdicts must never need the solve venv
+    # (task_dirs) -> [(task_name, metrics dict | None)]; numpy/mujoco only,
+    # since verdicts must never need the solve venv
     evaluate: Callable
     # rows -> printable table / (name, metrics) -> one line / rows -> verdict
     format_table: Callable

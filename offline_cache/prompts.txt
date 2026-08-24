@@ -30,3 +30,15 @@ A person lifts a box from the floor and walks forward.
 # example dir loads its text. Unbanked, both cache a silent zero.
 A person walks forward.
 A person walking forward quickly stumbles but maintains their balance
+
+# carry / mop
+
+A person mops the floor.
+A person carries a mop.
+
+# pole objects (lamp / tripod / clothes stand), for the pole task
+A person walks and carries a floor lamp with both hands.
+A person picks up a floor lamp and carries it away.
+A person grabs a standing pole with one hand and walks forward holding it.
+A person carries a tripod to another spot and sets it down.
+A person moves a clothes stand across the room.

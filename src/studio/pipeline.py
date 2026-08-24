@@ -24,21 +24,18 @@ _HEARTBEAT_LINES = 400
 
 def _stream(cmd, cwd: Path, log_path: Path, env: dict | None = None,
             sparse: bool = False) -> int:
-    """Run cmd, tee output to log_path; echo all lines, or only interesting
-    ones plus a heartbeat when sparse."""
+    """Run cmd, teeing output to log_path: every line, or only the
+    interesting ones plus a heartbeat when sparse."""
     proc = subprocess.Popen(
         [str(c) for c in cmd], cwd=str(cwd),
-        # unbuffered child so echoed lines stream live instead of arriving
-        # in block-buffered bursts
+        # unbuffered child, so echoed lines stream live
         env={**os.environ, "PYTHONUNBUFFERED": "1", **(env or {})},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     with open(log_path, "w") as log:
         for i, line in enumerate(proc.stdout):
             log.write(line)
-            if not sparse:
-                print(line, end="", flush=True)
-            elif _SOLVE_ECHO.search(line):
+            if not sparse or _SOLVE_ECHO.search(line):
                 print(line, end="", flush=True)
             elif i and i % _HEARTBEAT_LINES == 0:
                 print(f"  ... running ({i} log lines, see {log_path.name})",
@@ -92,8 +89,8 @@ def reconstruct(cfg: Config, run_dir: Path, motion_dir: Path,
     logs.mkdir(exist_ok=True)
     log_path = logs / "build.log"
 
-    # task naming keeps build_trial.py's convention: nested (Save Example
-    # shim) vs flat (bare motion NPZ)
+    # build_trial.py's naming convention: nested (Save Example shim) vs
+    # flat (bare motion NPZ)
     npz = next(iter(sorted(motion_dir.glob("*.npz"))))
     nested = (motion_dir.parent / "batch_inputs").is_dir()
     task = (f"{name}_{motion_dir.name.split('_')[-1]}_00" if nested

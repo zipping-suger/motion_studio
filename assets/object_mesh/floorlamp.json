@@ -1,0 +1,47 @@
+{
+  "name": "floorlamp",
+  "obj_file": "floorlamp_cleaned_simplified.obj",
+  "mesh_scale": 0.365351,
+  "mesh_quat": [
+    0.643037,
+    0.251515,
+    0.723347,
+    -0.003493
+  ],
+  "mesh_pos": [
+    0.3059,
+    0.1472,
+    0.8447
+  ],
+  "height": 1.7005,
+  "handle_radius": 0.0145,
+  "handle_z": [
+    0.0425,
+    1.658
+  ],
+  "grab_z": [
+    0.0925,
+    1.608
+  ],
+  "base": {
+    "kind": "cylinder",
+    "radius": 0.1287,
+    "half_height": 0.0114,
+    "center": [
+      0.0,
+      0.0,
+      0.0114
+    ]
+  },
+  "mass": 3.0,
+  "com": [
+    -0.0016,
+    -0.0019,
+    0.8258
+  ],
+  "inertia_per_mass": [
+    0.53762,
+    0.53778,
+    0.00579
+  ]
+}

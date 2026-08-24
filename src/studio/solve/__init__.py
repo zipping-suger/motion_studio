@@ -1,14 +1,9 @@
 """The SBMPC solve: studio's rewards over SPIDER's sampling optimizer.
 
-Split in two by what each half needs to import:
-
-- `evaluate.py` is numpy-only and runs in studio's own venv, so verdicts
-  and `studio list` never need the solve runtime.
-- `loop.py`, `rewards.py` and `spider_cfg.py` need torch, warp and the
-  SPIDER wheel. They run in the solve venv (`studio setup --solve`) as a
-  subprocess, reached through `command()` below.
-
-Nothing here imports torch, so the CLI stays instant.
+Split by what each half imports: `evaluate.py` is numpy-only and runs in
+studio's own venv, so verdicts never need the solve runtime; `loop.py`,
+`rewards.py` and `spider_cfg.py` need torch/warp/SPIDER and run in the
+solve venv as a subprocess, reached through `command()`.
 """
 
 import os

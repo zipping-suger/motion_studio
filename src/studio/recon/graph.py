@@ -17,13 +17,11 @@ velocity AND low acceleration relative to a scene node:
 Terrain support heights are measured against a per-clip floor calibration:
 every Kimodo motion starts standing, so the first CAL_FRAMES frames define
 the keypoint-to-sole offsets and the z=0 floor. Heights within FLOOR_EPS of
-the floor map to the scene's ground plane and produce no edge; only elevated
-supports (stairs, ledges, seats) become terrain edges for Stage 3.
+it produce no edge; only elevated supports become terrain edges for Stage 3.
 
-Edges violating force closure are flagged upstream (grasp quality flags);
-edges whose reconstructed plateau collides with the robot outside the
-interaction interval are pruned geometrically by the carving step in
-scene.py (Alg. 1 line 27).
+Force-closure violations are flagged upstream as grasp quality flags, and
+plateaus colliding with the robot outside their interval are pruned by
+scene.py's carving step (Alg. 1 line 27).
 """
 
 from dataclasses import dataclass, field
@@ -48,8 +46,8 @@ KEY_LINKS = ("left_wrist", "right_wrist", "left_foot", "right_foot", "pelvis")
 SCENE_TYPES = ("terrain", "object")
 
 FLOOR_EPS = 0.03       # m: supports closer than this to z=0 are the floor
-TERRAIN_MIN_H = 0.06   # m: lowest believable elevated support (real steps);
-                       # 3-6 cm "supports" are swing-apex noise -> floor
+TERRAIN_MIN_H = 0.06   # m: lowest believable elevated support; 3-6 cm
+                       # "supports" are swing-apex noise -> floor
 HEIGHT_STD_MAX = 0.015  # m: a planted foot does not bob
 CAL_FRAMES = 10        # frames of the initial stance used for floor calib
 FOOT_VEL_MAX = 0.25    # m/s: planted-foot keypoint speed bound
@@ -62,7 +60,7 @@ SIT_MIN_FRAMES = 15
 PELVIS_VEL_MAX = 0.15  # m/s
 PELVIS_SEAT_DROP = 0.12  # m: seat surface below the pelvis keypoint
 SIT_FEET_OFFSET_MIN = 0.15  # m: seated feet rest forward of the pelvis;
-                            # closer means a squat, which needs no seat
+                            # closer is a squat, which needs no seat
 
 
 @dataclass

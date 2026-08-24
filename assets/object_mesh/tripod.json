@@ -1,0 +1,47 @@
+{
+  "name": "tripod",
+  "obj_file": "tripod_cleaned_simplified.obj",
+  "mesh_scale": 0.200559,
+  "mesh_quat": [
+    0.690403,
+    0.584994,
+    0.368542,
+    -0.212845
+  ],
+  "mesh_pos": [
+    0.0515,
+    -0.1622,
+    0.5156
+  ],
+  "height": 1.401,
+  "handle_radius": 0.0084,
+  "handle_z": [
+    0.0701,
+    1.401
+  ],
+  "grab_z": [
+    0.1201,
+    1.351
+  ],
+  "base": {
+    "kind": "cylinder",
+    "radius": 0.1748,
+    "half_height": 0.0322,
+    "center": [
+      0.0,
+      0.0,
+      0.0322
+    ]
+  },
+  "mass": 1.5,
+  "com": [
+    0.0001,
+    -0.0039,
+    0.4688
+  ],
+  "inertia_per_mass": [
+    0.21675,
+    0.21688,
+    0.0036
+  ]
+}
