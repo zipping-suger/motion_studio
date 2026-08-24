@@ -1,15 +1,13 @@
 """Kick task parameters: defaults every layer shares.
 
 Pure data, importable everywhere (no mujoco, no torch) — same contract as
-`under_table_params`. The obstacle is a floor-standing box placed in the
-kicking foot's approach path: the reference swing penetrates it (that IS
-the augmentation signal), the solve re-paths the kick around it, and the
-kick point itself stays reachable.
+`under_table_params`. The obstacle is a floor-standing box in the kicking
+foot's approach path: the reference swing penetrates it (that IS the
+augmentation signal), the solve re-paths around it, and the kick point
+stays reachable.
 
-Solve defaults start from the under-table task's certified numbers with
-the leg-specific inversions a kick needs (the LEG is the avoiding limb
-here, so it must keep its exploration noise and get room to deviate).
-They have NOT been difficulty-swept yet — expect to retune.
+Solve defaults start from under_table's with the inversions a kick needs
+— the LEG is the avoiding limb here. Not difficulty-swept yet.
 """
 
 # --- scene: kick detection + obstacle placement (recon side) -------------
@@ -19,11 +17,10 @@ SCENE_DEFAULTS = {
     "contact_pair_margin": 0.04,
 
     "lift_thresh": 0.10,       # foot rise above stance that counts as swing
-    # Obstacle position along the approach: the difficulty knob. Later =
-    # closer to the kick = fewer frames to re-converge after the dodge.
-    # First real clip (2026-08-14): 0.45 with box_width 0.40 failed — the
-    # foot detoured 23cm laterally and never got back (kick_err 0.36);
-    # 0.25 with box_width 0.25 passes (kick_err 0.10, clearance 20mm).
+    # position along the approach: the difficulty knob. Later = closer to
+    # the kick = fewer frames to re-converge. 0.45 with box_width 0.40
+    # failed (foot detoured 23 cm and never got back, kick_err 0.36);
+    # 0.25 with box_width 0.25 passes (kick_err 0.10, clearance 20 mm).
     "path_frac": 0.25,
     "frac_jitter": 0.15,       # per-seed jitter on path_frac
     "y_jitter": 0.06,          # cross-path center jitter (m)
@@ -49,9 +46,9 @@ SOLVE_DEFAULTS = {
     "last_ctrl_noise_scale": 1.0,
     "final_noise_scale": 0.1,
     "joint_noise_scale": 0.1,
-    # the legs do the avoiding here — keep their exploration noise
-    # (under_table damps it to 0.3 because there the arms explore)
+    # the legs do the avoiding here, so they keep their exploration noise
     "leg_noise_scale": 1.0,
+    "hand_noise_scale": 0.0,   # BrainCo fingers (if present) hold rest
     "terminate_resample": True,
     "base_pos_threshold": 0.25,
     "base_rot_threshold": 0.3,
@@ -59,13 +56,13 @@ SOLVE_DEFAULTS = {
     "vel_rew_scale": 0.0001,
     "qw_base_pos": 15.0,
     "qw_base_rot": 10.0,
-    # legs get room to deviate around the obstacle (under_table pins them
-    # at 10 for balance while the arms deviate); collision-free beats
-    # tracking here, so the leg is barely pinned at all
+    # collision-free beats tracking here, so the leg is barely pinned
+    # (under_table holds legs at 10 for balance while the arms deviate)
     "qw_legs": 3.0,
     "qw_waist": 5.0,
     "qw_shoulder_elbow": 2.0,
     "qw_wrist": 2.0,           # hand pose is irrelevant to a kick
+    "qw_hands": 0.5,           # BrainCo fingers: rest pose, barely weighted
     # reward: stability + avoidance — avoidance deliberately heavy
     "stability_weight": 50.0,
     "sdf_weight": 30.0,
@@ -85,16 +82,12 @@ SOLVE_BOOL_KEYS = frozenset({"terminate_resample"})
 
 # --- verify: acceptance thresholds (evaluation, studio venv) -------------
 VERIFY_DEFAULTS = {
-    # collision-free is the objective: PASS needs real clearance, not just
-    # bounded penetration
+    # PASS needs real clearance, not bounded penetration
     "min_clearance": 0.01,     # worst-case clearance vs the obstacle (m)
-    # drift bounds are fall detectors, not fidelity — relaxed accordingly
-    # (knocked-over shows up as >= ~0.5m in the mppi_obstacle sweeps)
+    # fall detectors, not fidelity: knocked-over reads >= ~0.5 m
     "max_root_pos_err": 0.25,
     "max_root_rot_err": 0.45,
-    # task preservation: kicking foot vs the reference kick point at the
-    # kick frame — a solve can go collision-free by not kicking at all,
-    # and this is the check that catches it. Loose: the kick must happen,
-    # not mirror the reference.
+    # task preservation: a solve can go collision-free by not kicking at
+    # all. Loose — the kick must happen, not mirror the reference.
     "max_kick_err": 0.25,
 }

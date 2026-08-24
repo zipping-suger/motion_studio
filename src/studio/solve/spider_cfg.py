@@ -1,23 +1,19 @@
 """Build SPIDER's Config directly — no hydra.
 
-FIXED below is the whole solve configuration, resolved, as one dict. It is the
-task setup — timesteps, simulator sizing, noise schedule, what is saved.
-The hyperparameters worth tuning live in `config.SOLVE_DEFAULTS` and are
-layered on top per run.
-
-Values are validated literals, including `sim_dt` as
-0.0166667 rather than 1/60: it becomes the MuJoCo timestep
-(`spider/simulators/mjwp.py:80`), so the rounding is load-bearing for
-reproducing a solve.
+FIXED is the whole fixed task setup as one dict; the hyperparameters
+worth tuning live in `config.SOLVE_DEFAULTS` and layer on top per run.
+Values are validated literals — `sim_dt` is 0.0166667 rather than 1/60
+because it becomes the MuJoCo timestep, so the rounding reproduces.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from spider.config import Config, process_config
 
-from ..config import SOLVE_DEFAULTS, SOLVE_INT_KEYS
+from ..config import POLE_SOLVE_OVERRIDES, SOLVE_DEFAULTS, SOLVE_INT_KEYS
 
 FIXED = {
     # --- task -----------------------------------------------------------
@@ -85,10 +81,28 @@ def coerce(params: dict | None) -> dict:
     for key, val in (params or {}).items():
         if key not in SOLVE_DEFAULTS:
             raise SystemExit(f"unknown solve parameter: {key}")
-        # via the CLI these arrive as strings, and GUI number widgets hand
-        # back floats even for the integer params
+        # CLI values arrive as strings, GUI ones as floats even for ints
         out[key] = int(float(val)) if key in SOLVE_INT_KEYS else float(val)
     return out
+
+
+# solve params of studio's own reward terms — SPIDER's Config dataclass
+# rejects unknown kwargs, so these ride as attributes set after build
+STUDIO_KEYS = ("grip_rew_scale", "self_collision_rew_scale",
+               "upright_rew_scale", "obj_end_rew_scale",
+               "obj_mid_rew_scale")
+
+
+def _task_defaults(task: str, dataset_dir: Path) -> dict:
+    """Per-task-type solve defaults from the trial's own task_info: they
+    beat SOLVE_DEFAULTS but lose to explicit params."""
+    info_path = (Path(dataset_dir) / "processed" / "kimodo" / "unitree_g1"
+                 / "humanoid_object" / task / "task_info.json")
+    try:
+        task_type = json.loads(info_path.read_text()).get("task_type", "")
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return POLE_SOLVE_OVERRIDES if task_type.startswith("pole") else {}
 
 
 def build(task: str, dataset_dir: Path, params: dict | None = None) -> Config:
@@ -96,14 +110,18 @@ def build(task: str, dataset_dir: Path, params: dict | None = None) -> Config:
     values = {
         **FIXED,
         **SOLVE_DEFAULTS,
+        **_task_defaults(task, dataset_dir),
         **coerce(params),
         "task": task,
         "dataset_dir": str(dataset_dir),
     }
+    extra = {k: values.pop(k) for k in STUDIO_KEYS if k in values}
     config = process_config(Config(**values))
+    for key, val in extra.items():
+        setattr(config, key, val)
 
-    # studio.solve.loop implements exactly this envelope; anything else
-    # would silently take a code path that was dropped in the port
+    # loop.py implements exactly this envelope — anything else would take
+    # a code path the port dropped
     assert config.embodiment_type == "humanoid_object", config.embodiment_type
     assert not config.contact_guidance, "contact_guidance is not supported"
     assert not config.gibbs_sampling, "gibbs_sampling is not supported"

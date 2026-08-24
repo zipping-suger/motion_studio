@@ -1,17 +1,16 @@
 """Kimodo viser demo + scene-reconstruction add-on.
 
-Wraps the stock demo (kimodo stays pristine): constructs `Demo`, attaches
-an extra GUI folder to the same viser server, then hands control to
-`demo.run()`. The Reconstruct button saves the committed sample as a
-kimodo NPZ into raw_motion/, shells out to `studio recon` (CPU only, no
-VRAM cost next to the diffusion model),
-and overlays the reconstructed scene (table, terrain, animated box) on the
-playing motion. Solving stays in the separate solve panel (`studio panel`).
+Wraps the stock demo, leaving kimodo pristine: constructs `Demo`,
+attaches an extra GUI folder to the same viser server, then hands control
+to `demo.run()`. The Reconstruct button saves the committed sample into
+raw_motion/, shells out to `studio recon` (CPU only, so no VRAM cost next
+to the diffusion model), and overlays the reconstructed scene on the
+playing motion. The task dropdown picks box_carry or ground_pick.
+Solving stays in the separate solve panel (`studio panel`).
 
-The demo world is y-up (kimodo convention); the reconstruction is MuJoCo
-z-up. The loader maps mj = [kim_z, kim_x, kim_y], so the whole overlay
-lives under one parent frame rotated by the inverse permutation and all
-child poses stay in z-up scene coordinates.
+The demo world is y-up and the reconstruction MuJoCo z-up, so the whole
+overlay lives under one parent frame rotated by the inverse permutation
+and all child poses stay in z-up scene coordinates.
 """
 
 import argparse
@@ -31,7 +30,9 @@ STUDIO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(STUDIO_ROOT / "src"))
 
 from studio import viz
-from studio.config import (RAW_MOTION_DIR, RUNS_DIR, SCENE_DEFAULTS,
+from studio.config import (PICK_GRASPS, PICK_SCENE_DEFAULTS, PICK_SHAPES,
+                           POLE_OBJECTS, POLE_SCENE_DEFAULTS,
+                           RAW_MOTION_DIR, RUNS_DIR, SCENE_DEFAULTS,
                            load_config, task_dirs)
 from studio.shim import sanitize
 
@@ -74,20 +75,60 @@ class SceneReconAddon:
         gui = self.server.gui
         with gui.add_folder("Scene recon"):
             self.gui_name = gui.add_text("run name", initial_value="clip")
-            self.scene_widgets = viz.scene_param_widgets(gui, SCENE_DEFAULTS)
-            # contact window (the period the robot holds the object);
-            # -1 = full clip. "auto window" hands the choice to the grasp
-            # detector instead ("allow held start" lets it accept a clip
-            # that begins mid-hold); the reconstruct status line reports
-            # the window actually used, and after an auto run the detected
-            # frames land in the fields — untick auto to correct from
-            # there and re-click.
-            self.gui_auto = gui.add_checkbox("auto window", False)
-            self.gui_held = gui.add_checkbox("allow held start", False,
-                                             disabled=True)
-            self.gui_cstart = gui.add_number("contact start", -1, min=-1,
-                                             step=1)
-            self.gui_cend = gui.add_number("contact end", -1, min=-1, step=1)
+            self.gui_task = gui.add_dropdown(
+                "task", ("box_carry", "ground_pick", "pole"),
+                initial_value="box_carry")
+            self.folder_box = gui.add_folder("box_carry params")
+            with self.folder_box:
+                self.scene_widgets = viz.scene_param_widgets(gui,
+                                                             SCENE_DEFAULTS)
+                # contact window (the period the robot holds the object);
+                # -1 = full clip. "auto window" hands the choice to the grasp
+                # detector instead ("allow held start" lets it accept a clip
+                # that begins mid-hold); the reconstruct status line reports
+                # the window actually used, and after an auto run the detected
+                # frames land in the fields — untick auto to correct from
+                # there and re-click.
+                self.gui_auto = gui.add_checkbox("auto window", False)
+                self.gui_held = gui.add_checkbox("allow held start", False,
+                                                 disabled=True)
+                self.gui_cstart = gui.add_number("contact start", -1, min=-1,
+                                                 step=1)
+                self.gui_cend = gui.add_number("contact end", -1, min=-1,
+                                               step=1)
+            # ground_pick: a one-hand pick of a small object off the floor;
+            # the detector finds the picking hand and moment on its own
+            self.folder_pick = gui.add_folder("ground_pick params",
+                                              visible=False)
+            with self.folder_pick:
+                self.pick_widgets = {}
+                choices = {"shape": PICK_SHAPES, "grasp": PICK_GRASPS}
+                for key, val in PICK_SCENE_DEFAULTS.items():
+                    if key in choices:
+                        self.pick_widgets[key] = gui.add_dropdown(
+                            key, choices[key], initial_value=val)
+                    else:
+                        self.pick_widgets[key] = gui.add_number(
+                            key, float(val), min=0.0, step=0.01)
+            # pole: a hold/carry/mop of a pole-like OMOMO object; the
+            # detector finds the holding hands and window on its own
+            self.folder_pole = gui.add_folder("pole params",
+                                              visible=False)
+            with self.folder_pole:
+                self.pole_widgets = {}
+                choices = {"object": POLE_OBJECTS, "grasp": PICK_GRASPS}
+                for key, val in POLE_SCENE_DEFAULTS.items():
+                    if key in choices:
+                        self.pole_widgets[key] = gui.add_dropdown(
+                            key, choices[key], initial_value=val)
+                    elif isinstance(val, str):
+                        # free-form (the left/right hand windows:
+                        # auto | off | S-E frames)
+                        self.pole_widgets[key] = gui.add_text(
+                            key, initial_value=val)
+                    else:
+                        self.pole_widgets[key] = gui.add_number(
+                            key, float(val), min=0.0, step=0.01)
             self.gui_show = gui.add_checkbox("show scene", True)
             self.btn = gui.add_button("Reconstruct scene", color="teal")
             self.md = gui.add_markdown(
@@ -96,6 +137,13 @@ class SceneReconAddon:
         @self.gui_show.on_update
         def _(_):
             self.root.visible = self.gui_show.value
+
+        @self.gui_task.on_update
+        def _(_):
+            active = self.gui_task.value
+            self.folder_box.visible = active == "box_carry"
+            self.folder_pick.visible = active == "ground_pick"
+            self.folder_pole.visible = active == "pole"
 
         @self.gui_auto.on_update
         def _(_):
@@ -139,27 +187,40 @@ class SceneReconAddon:
                 "foot_contacts": motion.foot_contacts.detach().cpu().numpy(),
             })
 
-            flags = []
-            for k, w in self.scene_widgets.items():
-                flags += [f"--{k.replace('_', '-')}", str(w.value)]
-            if self.gui_auto.value:
-                # no window flags: recon's grasp detector picks the window
-                if self.gui_held.value:
-                    flags.append("--allow-held-start")
+            if self.gui_task.value == "ground_pick":
+                # the pick detector needs no window flags; object params
+                # travel as --set (box flags are box_carry-only)
+                flags = ["--task", "ground_pick"]
+                for k, w in self.pick_widgets.items():
+                    flags += ["--set", f"{k}={w.value}"]
+            elif self.gui_task.value == "pole":
+                flags = ["--task", "pole"]
+                for k, w in self.pole_widgets.items():
+                    flags += ["--set", f"{k}={w.value}"]
             else:
-                # explicit window: -1 defaults to the full clip (start at
-                # 0 implies a held start — box spawns in the hands)
-                T = int(motion.joints_pos.shape[0])
-                cs = int(self.gui_cstart.value)
-                ce = int(self.gui_cend.value)
-                flags += ["--pick-frame", str(cs if cs >= 0 else 0),
-                          "--release-frame", str(ce if ce >= 0 else T - 1)]
+                flags = []
+                for k, w in self.scene_widgets.items():
+                    flags += [f"--{k.replace('_', '-')}", str(w.value)]
+                if self.gui_auto.value:
+                    # no window flags: recon's grasp detector picks the
+                    # window
+                    if self.gui_held.value:
+                        flags.append("--allow-held-start")
+                else:
+                    # explicit window: -1 defaults to the full clip (start
+                    # at 0 implies a held start — box spawns in the hands)
+                    T = int(motion.joints_pos.shape[0])
+                    cs = int(self.gui_cstart.value)
+                    ce = int(self.gui_cend.value)
+                    flags += ["--pick-frame", str(cs if cs >= 0 else 0),
+                              "--release-frame", str(ce if ce >= 0 else T - 1)]
             proc = subprocess.run(
                 [studio_bin(), "recon", str(npz_path), "--name", name,
                  *flags],
                 capture_output=True, text=True)
             pick_line = next(
-                (ln for ln in proc.stdout.splitlines() if "pick f" in ln), "")
+                (ln for ln in proc.stdout.splitlines()
+                 if "pick f" in ln or "hold f" in ln), "")
             tasks = task_dirs(RUNS_DIR / name, prefix=name)
             if proc.returncode != 0 or not tasks:
                 tail = (pick_line or proc.stdout.strip().splitlines()[-1:]
@@ -168,7 +229,7 @@ class SceneReconAddon:
                 self.md.content = f"**failed/skipped**\n```\n{tail}\n```"
                 return
             self._load_overlay(tasks[0], client_id)
-            if self.gui_auto.value:
+            if self.gui_task.value == "box_carry" and self.gui_auto.value:
                 # surface the detected window in the fields, so unticking
                 # auto lets the user correct from it instead of from -1
                 m = re.search(r"pick f(\d+) release f(\d+)", pick_line)
@@ -187,7 +248,9 @@ class SceneReconAddon:
     def _load_overlay(self, task_dir: Path, client_id: int):
         info = viz.read_info(task_dir)
         ref_qpos = np.load(task_dir / "0/trajectory_kinematic.npz")["qpos"]
-        box_traj = ref_qpos[:, 36:43].copy()
+        # the object free joint is always last in qpos, whatever the robot
+        # layout (see studio.recon.layout — not importable here: no mujoco)
+        box_traj = ref_qpos[:, -7:].copy()
 
         self.state = None  # unpublish: anim thread must not touch old handles
         for h in [self.box_handle, *self.static_handles]:
@@ -197,7 +260,7 @@ class SceneReconAddon:
 
         self.static_handles = viz.add_scene(
             self.server, task_dir, prefix="/scene_recon", opacity=0.8)
-        mesh = viz.box_mesh(info)
+        mesh = viz.object_mesh(info)
         self.box_handle = self.server.scene.add_mesh_simple(
             "/scene_recon/box", mesh.vertices, mesh.faces,
             color=(200, 60, 60), opacity=0.6,

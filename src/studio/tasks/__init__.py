@@ -1,15 +1,15 @@
 """Downstream-task registry.
 
-Each task implementation module exposes a module-level ``TASK`` (see
-`base.Task`). Loading is lazy so listing names never drags in a task's
-heavy imports (mujoco for recon-side code); torch never loads here — solve
-runtimes are reached only through each task's subprocess command.
+Each task module exposes a module-level ``TASK`` (see `base.Task`).
+Loading is lazy so listing names never drags in a task's heavy imports;
+torch never loads here, since solve runtimes are reached only through
+each task's subprocess command.
 
     tasks.load("under_table").reconstruct(npz, out_root, name, options)
 
-config.yml's ``tasks: {<name>: {scene: ..., solve: ...}}`` section overrides
-a task's defaults per machine; `overrides()` exposes the loaded section
-(config.TASK_OVERRIDES) so the CLI and task modules merge from one place.
+config.yml's ``tasks: {<name>: {scene: ..., solve: ...}}`` overrides a
+task's defaults per machine; `overrides()` exposes the loaded section so
+the CLI and task modules merge from one place.
 """
 
 import importlib
@@ -23,6 +23,8 @@ _REGISTRY = {
     "box_carry": ".box_carry",
     "under_table": ".under_table",
     "kick": ".kick",
+    "ground_pick": ".ground_pick",
+    "pole": ".pole",
 }
 
 

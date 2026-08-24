@@ -5,10 +5,7 @@ against these, `studio.recon.table` consumes the scene set, and
 `studio.solve.mppi_loop` (solve venv) consumes the solve set — so nothing
 here may import mujoco or torch.
 
-Values are the mppi_obstacle experiment's certified defaults
-(obstacle_config.yml; see its README for the difficulty sweeps behind
-max_ref_table_pen / underside_drop / yaw_range and the reward-shaping
-notes). config.yml's ``tasks: under_table:`` section overrides per machine,
+config.yml's ``tasks: under_table:`` section overrides per machine,
 ``--set key=value`` per run.
 """
 
@@ -17,10 +14,9 @@ SCENE_DEFAULTS = {
     "scene_seed": 0,           # rng for jitter + yaw; the randomization knob
     "hard_collision": True,    # solid table; SDF reward keeps contacts grazing
     "contact_pair_margin": 0.04,
-    # Arms may conflict with the slab: placement (underside + near-edge
-    # scan) is driven by head/torso/legs only, so a reach at slab height
-    # cannot push the table away from the head — re-pathing the arms is
-    # the solver's work. False restores whole-body placement scans.
+    # arms may conflict with the slab: placement scans use head/torso/legs
+    # only, so a reach at slab height cannot push the table off the head.
+    # False restores whole-body placement scans.
     "arm_conflict": True,
 
     "slab_thickness": 0.05,
@@ -62,17 +58,20 @@ SOLVE_DEFAULTS = {
     "final_noise_scale": 0.1,
     "joint_noise_scale": 0.1,
     "leg_noise_scale": 0.3,    # damp leg exploration; arms do the avoiding
+    "hand_noise_scale": 0.0,   # 0 locks the BrainCo fingers on the rest
+                               # pose: no contacts, no exploration
     "terminate_resample": True,  # kill & replace diverged samples
     "base_pos_threshold": 0.25,
     "base_rot_threshold": 0.3,
     # reward: tracking
     "vel_rew_scale": 0.0001,
-    "qw_base_pos": 15.0,       # per-group qpos tracking weights (nv=35)
+    "qw_base_pos": 15.0,       # per-group qpos tracking weights
     "qw_base_rot": 10.0,
     "qw_legs": 10.0,
     "qw_waist": 5.0,
     "qw_shoulder_elbow": 2.0,  # arms free to deviate for avoidance
     "qw_wrist": 10.0,
+    "qw_hands": 0.5,           # BrainCo fingers: rest pose, barely weighted
     # reward: stability + avoidance
     "stability_weight": 50.0,  # tilt term is reference-relative
     "sdf_weight": 20.0,
@@ -92,9 +91,8 @@ SOLVE_BOOL_KEYS = frozenset({"terminate_resample"})
 
 # --- verify: acceptance thresholds (evaluation, studio venv) -------------
 VERIFY_DEFAULTS = {
-    # collision-free is the objective: PASS needs real clearance, not just
-    # bounded penetration — grazing solutions are untrackable downstream
-    # (any tracking error there means solid contact)
+    # PASS needs real clearance, not bounded penetration: a grazing
+    # solution is untrackable, since any tracking error means contact
     "min_clearance": 0.01,     # worst-case clearance vs any primitive (m)
     "max_root_pos_err": 0.15,  # fall detector, not fidelity (m)
     "max_root_rot_err": 0.30,  # (rad)

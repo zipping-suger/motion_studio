@@ -1,16 +1,11 @@
 """Obstacle-avoidance MPPI reward: tracking + stability + SDF + collisions.
 
-The under-table counterpart of `rewards.py`: instead of layering object
+The under-table counterpart of `rewards.py`. Rather than layering object
 terms over SPIDER's humanoid_object reward, this replaces the reward
-outright for the robot-only (``humanoid``) embodiment — weighted qpos
-tracking, dedicated base-drift penalties, a reference-relative stability
-term, and analytic-SDF obstacle avoidance with a per-sample collision
-count.
+outright for the robot-only (``humanoid``) embodiment. Weights arrive as
+the flat params dict of `tasks.under_table_params.SOLVE_DEFAULTS`.
 
-Ported from the mppi_obstacle experiment's rewards.py (itself derived from
-spider/examples/tutorial_collision_free_aug.ipynb). Runs in the solve venv
-(torch + warp + SPIDER); reward weights arrive as the flat params dict of
-`tasks.under_table_params.SOLVE_DEFAULTS`.
+Solve venv only (torch + warp + SPIDER).
 """
 
 from __future__ import annotations
@@ -21,27 +16,53 @@ import mujoco
 import torch
 import warp as wp
 
-# Reuse spider's quaternion-correct qpos difference (humanoid branch).
-from spider.simulators.mjwp import _diff_qpos
+from .quat import quat_sub
 
 
-def build_qpos_weight(nv: int, p: dict, device) -> torch.Tensor:
-    """Per-DOF tracking weights for the G1 humanoid (nv=35).
+# joint-name keywords -> tracking-weight param; first match wins
+_QW_GROUPS = (
+    (("hip", "knee", "ankle"), "qw_legs"),
+    (("waist",), "qw_waist"),
+    (("shoulder", "elbow"), "qw_shoulder_elbow"),
+    (("wrist",), "qw_wrist"),
+    (("thumb", "index", "middle", "ring", "pinky"), "qw_hands"),
+)
 
-    Layout: [0:3] base pos, [3:6] base rot, [6:18] legs, [18:21] waist,
-    [21:25]/[28:32] shoulder+elbow, [25:28]/[32:35] wrist.
-    """
-    assert nv == 35, f"G1 humanoid expects nv=35, got {nv}"
-    w = torch.ones(nv, device=device)
+# joints the arm damping term covers (fingers included: zero reference
+# velocity, so damping them is free)
+_ARM_VEL_KEYWORDS = ("shoulder", "elbow", "wrist",
+                     "thumb", "index", "middle", "ring", "pinky")
+
+
+def _hinge_joints(mj_model):
+    """(name, dofadr) for every hinge joint, whatever the layout."""
+    out = []
+    for j in range(mj_model.njnt):
+        if mj_model.jnt_type[j] != mujoco.mjtJoint.mjJNT_HINGE:
+            continue
+        name = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_JOINT, j) or ""
+        out.append((name, int(mj_model.jnt_dofadr[j])))
+    return out
+
+
+def build_qpos_weight(mj_model, p: dict, device) -> torch.Tensor:
+    """Per-DOF tracking weights, classified by joint name so the layout
+    (with or without the BrainCo hand joints) never matters."""
+    w = torch.ones(mj_model.nv, device=device)
     w[0:3] = p["qw_base_pos"]
     w[3:6] = p["qw_base_rot"]
-    w[6:18] = p["qw_legs"]
-    w[18:21] = p["qw_waist"]
-    w[21:25] = p["qw_shoulder_elbow"]  # left shoulder + elbow
-    w[25:28] = p["qw_wrist"]           # left wrist — hand pose
-    w[28:32] = p["qw_shoulder_elbow"]  # right shoulder + elbow
-    w[32:35] = p["qw_wrist"]           # right wrist
+    for name, adr in _hinge_joints(mj_model):
+        for keywords, param in _QW_GROUPS:
+            if any(k in name for k in keywords):
+                w[adr] = p[param]
+                break
     return w
+
+
+def arm_dof_indices(mj_model) -> list:
+    """dof addresses of the arm and finger joints."""
+    return [adr for name, adr in _hinge_joints(mj_model)
+            if any(k in name for k in _ARM_VEL_KEYWORDS)]
 
 
 def _point_box_sdf(points, center, half_extents, yaw):
@@ -66,22 +87,28 @@ class ObstacleSet:
         self._cache: dict = {}
 
     def _tensors(self, device):
+        # stacked over the K primitives: min_sdf is then one batched op
         if device not in self._cache:
-            self._cache[device] = [
-                (torch.tensor(pos, device=device, dtype=torch.float32),
-                 torch.tensor(params[:3], device=device, dtype=torch.float32),
-                 torch.tensor(params[3], device=device, dtype=torch.float32))
-                for _obs_type, pos, params in self.primitives
-            ]
+            self._cache[device] = (
+                torch.tensor([pos for _t, pos, _p in self.primitives],
+                             device=device, dtype=torch.float32),
+                torch.tensor([params[:3] for _t, _pos, params
+                              in self.primitives],
+                             device=device, dtype=torch.float32),
+                torch.tensor([params[3] for _t, _pos, params
+                              in self.primitives],
+                             device=device, dtype=torch.float32),
+            )
         return self._cache[device]
 
     def min_sdf(self, points: torch.Tensor) -> torch.Tensor:
         """Minimum signed distance from each point to any primitive."""
-        min_sdf = torch.full(points.shape[:-1], 1e6, device=points.device)
-        for center, half, yaw in self._tensors(points.device):
-            min_sdf = torch.minimum(min_sdf,
-                                    _point_box_sdf(points, center, half, yaw))
-        return min_sdf
+        if not self.primitives:
+            return torch.full(points.shape[:-1], 1e6, device=points.device)
+        centers, halves, yaws = self._tensors(points.device)
+        # (..., 1, 3) against (K, 3)/(K,) broadcasts to a (..., K) SDF
+        sdf = _point_box_sdf(points.unsqueeze(-2), centers, halves, yaws)
+        return sdf.min(dim=-1).values
 
 
 @dataclass
@@ -101,11 +128,21 @@ class RobotCollisionGeoms:
             if gid < 0:
                 continue
             ids.append(gid)
-            radii.append(float(mj_model.geom_size[gid, 0]))
-            cap = mj_model.geom_type[gid] == mujoco.mjtGeom.mjGEOM_CAPSULE
-            is_capsule.append(bool(cap))
-            half_lengths.append(float(mj_model.geom_size[gid, 1]) if cap
-                                else 0.0)
+            gtype = mj_model.geom_type[gid]
+            if gtype == mujoco.mjtGeom.mjGEOM_CAPSULE:
+                is_capsule.append(True)
+                radii.append(float(mj_model.geom_size[gid, 0]))
+                half_lengths.append(float(mj_model.geom_size[gid, 1]))
+            elif gtype == mujoco.mjtGeom.mjGEOM_BOX:
+                # e.g. the BrainCo palm: sample as a capsule along the
+                # box's z (long) axis, radius from the lateral extents
+                is_capsule.append(True)
+                radii.append(float(mj_model.geom_size[gid, :2].max()))
+                half_lengths.append(float(mj_model.geom_size[gid, 2]))
+            else:
+                is_capsule.append(False)
+                radii.append(float(mj_model.geom_size[gid, 0]))
+                half_lengths.append(0.0)
         return cls(ids, radii, half_lengths, is_capsule)
 
 
@@ -119,30 +156,41 @@ def _stability_reward(qpos_sim: torch.Tensor,
 
     qx, qy = qpos_sim[:, 4], qpos_sim[:, 5]
     up_z = 1.0 - 2.0 * (qx**2 + qy**2)
-    # Reference-relative, not absolute: the under-table crouch tilts the
-    # pelvis up to ~39 degrees in the reference itself — an absolute term
-    # costs a constant ~11 (at weight 50) for tracking correctly and pushes
-    # the solve to straighten out of the crouch. Only tilting MORE than the
-    # reference at the same frame is penalized. Linear, not squared: a
-    # 15-degree extra lean gives up_ref-up_z ~ 0.034; squared that is
-    # ~0.001, invisible next to tracking until the robot has tipped.
+    # Reference-relative: the under-table crouch tilts the pelvis ~39
+    # degrees in the reference itself, so an absolute term would push the
+    # solve to straighten out of it. Linear, not squared — squared, a 15
+    # degree extra lean is invisible next to tracking until it has tipped.
     up_ref = 1.0 - 2.0 * (qpos_ref[4] ** 2 + qpos_ref[5] ** 2)
     tilt_penalty = torch.clamp(up_ref - up_z, min=0.0)
 
     return -(height_penalty + tilt_penalty)
 
 
-def make_reward_fns(params: dict, robot_geoms: RobotCollisionGeoms,
+def get_terminate(config, env, ref):
+    """mjwp.get_terminate's humanoid branch with the sync-free quat_sub;
+    the terminate-resample path evaluates it every rollout sim step."""
+    qpos_sim = wp.to_torch(env.data_wp.qpos)
+    qpos_ref = ref[0]
+    pos_err = torch.norm(qpos_sim[:, :3] - qpos_ref[:3], p=2, dim=1)
+    rot_err = torch.norm(quat_sub(qpos_sim[:, 3:7], qpos_ref[3:7]),
+                         p=2, dim=1)
+    return ((pos_err > config.base_pos_threshold)
+            | (rot_err > config.base_rot_threshold))
+
+
+def make_reward_fns(params: dict, mj_model, robot_geoms: RobotCollisionGeoms,
                     obstacles: ObstacleSet, obstacle_geom_ids: list):
     """Build (get_reward, get_terminal_reward) for spider's make_rollout_fn.
 
-    ``params`` is the resolved under_table solve dict; robot_geoms /
-    obstacles / obstacle_geom_ids describe the injected scene.
+    ``params`` is the resolved under_table solve dict; the rest describe
+    the injected scene model.
     """
     weight_cache: dict = {}
     geom_cache: dict = {}
     obs_ids_cache: dict = {}
+    arm_idx_cache: dict = {}
     obs_ids_cpu = torch.tensor(obstacle_geom_ids, dtype=torch.int32)
+    arm_idx_cpu = torch.tensor(arm_dof_indices(mj_model), dtype=torch.long)
 
     def _geom_tensors(device):
         """Index tensors for batched point assembly: capsules first, then
@@ -196,10 +244,8 @@ def make_reward_fns(params: dict, robot_geoms: RobotCollisionGeoms,
         clearance = obstacles.min_sdf(points) - radii[None, :]
         violation = torch.clamp(params["collision_margin"] - clearance,
                                 min=0.0)
-        # Two-tier hinge: the outer linear hinge equilibrates against
-        # tracking cost right at the surface (grazing); the steeper inner
-        # hinge makes the last collision_inner_margin metres
-        # disproportionately expensive so solutions keep real clearance.
+        # two-tier hinge: the outer one equilibrates against tracking cost
+        # at the surface, the steeper inner one buys real clearance
         if params["collision_inner_margin"] > 0.0:
             inner = torch.clamp(params["collision_inner_margin"] - clearance,
                                 min=0.0)
@@ -225,15 +271,15 @@ def make_reward_fns(params: dict, robot_geoms: RobotCollisionGeoms,
         active = contact_dim > 0
         is_obs = torch.isin(contact_geom[:, 0], obs_ids) | torch.isin(
             contact_geom[:, 1], obs_ids)
-        valid = active & is_obs & (contact_dist < 0.0)
+        wids = contact_worldid.long()
+        valid = (active & is_obs & (contact_dist < 0.0)
+                 & (wids >= 0) & (wids < num_samples))
 
+        # unconditional masked scatter: invalid slots land on index 0 with
+        # weight 0, so no data-dependent branch syncs the host
         counts = torch.zeros(num_samples, device=device)
-        if valid.any():
-            wids = contact_worldid[valid].long()
-            wids = wids[(wids >= 0) & (wids < num_samples)]
-            if wids.numel() > 0:
-                counts.scatter_add_(0, wids,
-                                    torch.ones(wids.shape[0], device=device))
+        counts.scatter_add_(0, wids.clamp(0, num_samples - 1),
+                            valid.to(counts.dtype))
         return -counts
 
     def get_reward(config, env, ref):
@@ -242,31 +288,35 @@ def make_reward_fns(params: dict, robot_geoms: RobotCollisionGeoms,
         qvel_sim = wp.to_torch(env.data_wp.qvel)
         device = config.device
 
-        # Weighted qpos tracking (mirrors mjwp.get_reward, custom weights)
-        qpos_diff = _diff_qpos(
-            config, qpos_sim,
-            qpos_ref.unsqueeze(0).repeat(qpos_sim.shape[0], 1))
+        # mjwp._diff_qpos's humanoid branch, inlined with the sync-free
+        # quat_sub and studio's own weights
+        qpos_diff = torch.cat(
+            [
+                qpos_sim[:, :3] - qpos_ref[:3],
+                quat_sub(qpos_sim[:, 3:7], qpos_ref[3:7]),
+                qpos_sim[:, 7:] - qpos_ref[7:],
+            ],
+            dim=1,
+        )
         if device not in weight_cache:
-            weight_cache[device] = build_qpos_weight(config.nv, params, device)
+            weight_cache[device] = build_qpos_weight(mj_model, params, device)
+            arm_idx_cache[device] = arm_idx_cpu.to(device)
         qpos_dist = torch.norm(qpos_diff * weight_cache[device], p=2, dim=1)
         qvel_dist = torch.norm(qvel_sim - qvel_ref, p=2, dim=1)
         qpos_rew = -qpos_dist
         qvel_rew = -config.vel_rew_scale * qvel_dist
 
-        # Dedicated base-drift penalties, quadratic and OUTSIDE the coupled
-        # tracking norm: the norm's sqrt compresses marginal base error
-        # whenever the arm deviates for avoidance, making base drift the
-        # cheapest error to trade away. Quadratic growth makes accumulating
-        # drift increasingly expensive instead.
+        # base drift, quadratic and OUTSIDE the tracking norm: the norm's
+        # sqrt compresses base error whenever an arm deviates to avoid,
+        # making drift the cheapest error to trade away
         base_pos_pen = (qpos_diff[:, :3] ** 2).sum(dim=1)
         base_rot_pen = (qpos_diff[:, 3:6] ** 2).sum(dim=1)
-        # Horizontal base velocity error: catches a forward trip while it is
-        # still momentum, before it becomes displacement.
+        # catches a forward trip while still momentum, not displacement
         base_vel_pen = torch.norm(qvel_sim[:, :2] - qvel_ref[:2], p=2, dim=1)
-        # Arm joint-velocity error (DOF 21:35): damps the press-shove-press
-        # oscillation where wrist tracking and contact/SDF forces fight at
-        # the table.
-        arm_vel_pen = torch.norm(qvel_sim[:, 21:35] - qvel_ref[21:35],
+        # damps the press-shove-press oscillation where wrist tracking and
+        # contact/SDF forces fight at the table
+        arm_idx = arm_idx_cache[device]
+        arm_vel_pen = torch.norm(qvel_sim[:, arm_idx] - qvel_ref[arm_idx],
                                  p=2, dim=1)
 
         stab_rew = _stability_reward(qpos_sim, qpos_ref)

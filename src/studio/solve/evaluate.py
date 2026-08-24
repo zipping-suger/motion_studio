@@ -25,6 +25,13 @@ LIFT_FRACTION = 0.7        # sim must reach this much of the reference lift
 LIFT_FINAL_MAX = 0.2       # m, final object position error
 
 
+def _body_z(quat: np.ndarray) -> np.ndarray:
+    """Body z axis per frame, (T, 4) wxyz -> (T, 3)."""
+    w, x, y, z = quat.T
+    return np.stack([2 * (x * z + w * y), 2 * (y * z - w * x),
+                     1 - 2 * (x * x + y * y)], axis=1)
+
+
 def _smoothness(q_joints: np.ndarray) -> float:
     """DynaRetarget Eq. 5: L1 sum of finite-difference joint accelerations.
 
@@ -44,34 +51,42 @@ def evaluate_task(task_dir: Path,
     if not res_path.exists():
         return None
 
-    q = np.load(res_path)["qpos"].reshape(-1, 43)
+    arr = np.load(res_path)["qpos"]
+    q = arr.reshape(-1, arr.shape[-1])
     rq = np.load(task_dir / "0" / REFERENCE_NPZ)["qpos"]
     info = json.loads((task_dir / "task_info.json").read_text())
 
-    # the solve runs at 60 Hz, the reference at 30 — index the reference at
-    # half rate, clamped to its last frame
+    # solve runs at 60 Hz, reference at 30. The box free joint is always
+    # last in qpos (layout.check_scene), hence the negative indexing.
     idx = np.minimum(np.arange(len(q)) // 2, len(rq) - 1)
-    op = np.linalg.norm(q[:, 36:39] - rq[idx, 36:39], axis=1)
-    dot = np.abs(np.sum(q[:, 39:43] * rq[idx, 39:43], axis=1)).clip(0, 1)
-    orot = 2 * np.arccos(dot)
+    op = np.linalg.norm(q[:, -7:-4] - rq[idx, -7:-4], axis=1)
+    if info.get("task_type", "").startswith("pole"):
+        # axis TILT only: the reference's roll about the handle is a
+        # parallel-transport artifact of _axis_quats, not data, and a
+        # capsule handle cannot hold spin anyway
+        za, zr = _body_z(q[:, -4:]), _body_z(rq[idx, -4:])
+        orot = np.arccos(np.sum(za * zr, axis=1).clip(-1, 1))
+    else:
+        dot = np.abs(np.sum(q[:, -4:] * rq[idx, -4:], axis=1)).clip(0, 1)
+        orot = 2 * np.arccos(dot)
     bp = np.linalg.norm(q[:, :3] - rq[idx, :3], axis=1)
 
-    ref_lift = rq[-1, 38] - rq[0, 38]
-    sim_lift = q[-1, 38] - rq[0, 38]
+    ref_lift = rq[-1, -5] - rq[0, -5]
+    sim_lift = q[-1, -5] - rq[0, -5]
     lifted = bool(ref_lift > LIFT_MIN_REF
                   and sim_lift >= LIFT_FRACTION * ref_lift
                   and op[-1] < LIFT_FINAL_MAX)
     succ_dr = bool(op.mean() < DR_POS_MAX and orot.mean() < DR_ROT_MAX)
 
-    # smoothness ratio, sim decimated onto the reference timebase
+    # sim decimated onto the reference timebase; all robot joints, no box
     qs = q[::2][:len(rq)]
-    s_ref = _smoothness(rq[:len(qs), 7:36])
-    smooth = _smoothness(qs[:, 7:36]) / max(s_ref, 1e-9)
+    s_ref = _smoothness(rq[:len(qs), 7:-7])
+    smooth = _smoothness(qs[:, 7:-7]) / max(s_ref, 1e-9)
 
     return {
         "op_mean": float(op.mean()), "op_final": float(op[-1]),
         "orot_mean": float(orot.mean()), "bp_mean": float(bp.mean()),
-        "final_box_z": float(q[-1, 38]), "ref_final_box_z": float(rq[-1, 38]),
+        "final_box_z": float(q[-1, -5]), "ref_final_box_z": float(rq[-1, -5]),
         "flags": ",".join(info.get("quality_flags", [])) or "-",
         "lifted": lifted, "succ_dr": succ_dr, "smooth": float(smooth),
     }

@@ -31,7 +31,28 @@ def read_info(task_dir: Path) -> dict:
     return json.loads((task_dir / "task_info.json").read_text())
 
 
-def box_mesh(info: dict):
+def object_mesh(info: dict):
+    """The carried object's mesh. box_carry trials record only box_size;
+    ground_pick trials also record the object's shape; pole trials name
+    an OMOMO mesh, loaded through its sidecar's canonicalizing affine
+    (see scripts/prep_object_mesh.py)."""
+    obj = info.get("object") or {}
+    if obj.get("name"):
+        from .config import REPO_ROOT
+        mesh_dir = REPO_ROOT / "assets" / "object_mesh"
+        spec = json.loads((mesh_dir / f"{obj['name']}.json").read_text())
+        mesh = trimesh.load(mesh_dir / spec["obj_file"], force="mesh")
+        T = trimesh.transformations.quaternion_matrix(spec["mesh_quat"])
+        T[:3, :3] *= spec["mesh_scale"]
+        T[:3, 3] = spec["mesh_pos"]
+        mesh.apply_transform(T)
+        return mesh
+    if obj.get("shape") == "ball":
+        return trimesh.creation.icosphere(subdivisions=3,
+                                          radius=obj["size"] / 2)
+    if obj.get("shape") == "cylinder":
+        return trimesh.creation.cylinder(radius=obj["size"] / 2,
+                                         height=obj["cyl_height"])
     return trimesh.creation.box(info["box_size"])
 
 
@@ -47,7 +68,7 @@ def add_scene(server, task_dir: Path, prefix: str = "/scene",
     info = read_info(task_dir)
     add = server.scene.add_mesh_simple
     # only pass opacity when asked: viser switches to a transparent
-    # material as soon as the argument is present
+    # material as soon as the argument is present at all
     kw = {} if opacity is None else {"opacity": opacity}
     handles = []
 

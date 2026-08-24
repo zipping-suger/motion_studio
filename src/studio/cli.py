@@ -39,8 +39,7 @@ def _spider(cfg: Config, explicit: str | None) -> Path:
 
 
 def _checked_out(repo: Path) -> bool:
-    # a submodule checkout has a .git *file*; an uninitialized one is an
-    # empty dir
+    # a submodule checkout has a .git *file*; uninitialized is an empty dir
     return (repo / ".git").exists()
 
 
@@ -57,10 +56,19 @@ def _init_submodules(*repos: Path) -> None:
               "--depth", "1", *need])
 
 
-def _setup_assets(cfg: Config, spider: Path) -> None:
+def _setup_assets(cfg: Config, spider: Path, args) -> None:
     print("== G1 assets ==")
     n = recon.assets.install(spider)
     print(f"installed {n} file(s) into {recon.assets.G1_DIR}")
+    root = (args.unitree_g1 or os.environ.get("UNITREE_G1_ROOT")
+            or cfg.unitree_g1)
+    if root:
+        n = recon.assets.install_brainco(Path(root).expanduser())
+        print(f"installed {n} BrainCo-hand file(s) into "
+              f"{recon.assets.G1_DIR}")
+    else:
+        print("skipping the BrainCo-hand variant: no unitree_g1 checkout "
+              "configured (paths.unitree_g1 in config.yml, or --unitree-g1)")
 
 
 def _setup_kimodo(cfg: Config) -> None:
@@ -70,13 +78,12 @@ def _setup_kimodo(cfg: Config) -> None:
         _run(["uv", "venv", "--python", "3.11", venv])
     pip = ["uv", "pip", "install", "--python", cfg.kimodo_python]
     _run(pip + ["torch"])
-    # base install only: the [demo] extra would pull the viser fork from git,
+    # base install only: the [demo] extra pulls the viser fork from git,
     # clobbering the editable install of the local clone below
     _run(pip + ["-e", cfg.kimodo_repo],
          env={"SKIP_MOTION_CORRECTION_IN_SETUP": "1"})
-    # the demo needs the kimodo-viser fork; prefer a local checkout (a
-    # kimodo checkout with the fork cloned inside it, else the extern/
-    # submodule) so it installs editable and pinned
+    # the demo needs the kimodo-viser fork; prefer a local checkout so it
+    # installs editable and pinned
     for local_viser in (cfg.kimodo_repo / "kimodo-viser", DEFAULT_KIMODO_VISER):
         if _checked_out(local_viser):
             _run(pip + ["-e", local_viser])
@@ -86,16 +93,16 @@ def _setup_kimodo(cfg: Config) -> None:
 
 
 def _setup_solve(cfg: Config, spider: Path) -> None:
-    """The solve runtime: SPIDER pins its own torch, warp and mujoco-warp,
-    which is exactly why it gets its own venv instead of studio's."""
+    """The solve runtime; SPIDER pins its own torch, warp and mujoco-warp,
+    which is why it gets a venv of its own."""
     print("\n== solve venv (torch + warp + SPIDER) ==")
     venv = cfg.solve_python.parent.parent
     if not cfg.solve_python.exists():
         # SPIDER requires >= 3.12
         _run(["uv", "venv", "--python", "3.12", venv])
     _run(["uv", "pip", "install", "--python", cfg.solve_python,
-          # warp-lang / mujoco-warp are served from NVIDIA's index; uv
-          # sources are not transitive, so the index is named again here
+          # warp-lang / mujoco-warp come from NVIDIA's index; uv sources
+          # are not transitive, so it is named again here
           "--extra-index-url", "https://pypi.nvidia.com/",
           "--index-strategy", "unsafe-best-match",
           str(spider),
@@ -117,7 +124,7 @@ def cmd_setup(cfg: Config, args) -> int:
     _init_submodules(*wanted)
 
     if "assets" in stages:
-        _setup_assets(cfg, spider)
+        _setup_assets(cfg, spider, args)
     if "kimodo" in stages:
         _setup_kimodo(cfg)
     if "solve" in stages:
@@ -133,8 +140,8 @@ def cmd_setup(cfg: Config, args) -> int:
 
 def cmd_tunnel(cfg: Config, args) -> int:
     fwd = f"{cfg.encoder_port}:localhost:{cfg.encoder_port}"
-    # accept-new: compute nodes rotate, and the connection already rides
-    # through the trusted login host
+    # accept-new: compute nodes rotate, and the connection rides through
+    # the trusted login host
     base = ["ssh", "-N", "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ServerAliveInterval=30", "-o", "ExitOnForwardFailure=yes"]
     if args.node:
@@ -189,7 +196,7 @@ def cmd_demo(cfg: Config, args) -> int:
             print("offline encoder server did not come up", file=sys.stderr)
             return 1
         # isolated cache: offline zero-embeddings must never pollute the
-        # real demo cache used by tunnel sessions
+        # real demo cache tunnel sessions use
         env["kimodo_EMBED_CACHE_DIR"] = str(emb_dir)
         print(f"offline mode: known prompts from {len(snapshots)} snapshot(s) "
               "+ demo cache; NEW prompts will be IGNORED by generation "
@@ -246,8 +253,8 @@ def cmd_run(cfg: Config, args) -> int:
 
 
 def _parse_set(items, defaults: dict, task_name: str, what: str) -> dict:
-    """--set KEY=VALUE pairs, keys validated against the task's defaults
-    (values stay strings; each consumer coerces to the default's type)."""
+    """--set KEY=VALUE pairs, keys validated against the task's defaults;
+    values stay strings and each consumer coerces them."""
     out = {}
     for item in items or []:
         key, sep, value = item.partition("=")
@@ -343,13 +350,17 @@ def cmd_solve(cfg: Config, args) -> int:
                             task_obj.name, "solve")
     if task_obj.name == "box_carry":
         params = {**box_params, **set_params}
+    elif set(task_obj.solve_defaults) == set(SOLVE_DEFAULTS):
+        # ground_pick and pole run the same SBMPC solver, so the box-style
+        # solve flags apply and config.yml's tasks.<name>.solve rides along
+        params = {**tasks.overrides(task_obj.name, "solve"),
+                  **box_params, **set_params}
     else:
         if box_params:
             raise SystemExit(
                 f"{', '.join(sorted(box_params))}: box_carry-only solve "
                 f"flag(s); use --set key=value for {task_obj.name} params")
-        # config.yml task overrides ride along explicitly — the solve
-        # subprocess never reads config.yml itself
+        # passed explicitly: the solve subprocess never reads config.yml
         params = {**tasks.overrides(task_obj.name, "solve"), **set_params}
     return 0 if pipeline.solve_tasks(cfg, run_dir, trial_dirs, params) else 1
 
@@ -426,6 +437,10 @@ def main() -> None:
     p.add_argument("--spider", default=None,
                    help="SPIDER checkout or .whl (default: paths.spider in "
                         "config.yml, or $SPIDER_ROOT)")
+    p.add_argument("--unitree-g1", default=None,
+                   help="unitree_g1 checkout with the BrainCo-hand model "
+                        "(default: paths.unitree_g1 in config.yml, or "
+                        "$UNITREE_G1_ROOT; unset = handless model only)")
     p.set_defaults(func=cmd_setup)
     p = sub.add_parser("tunnel", help="SSH tunnel to the remote text encoder")
     p.add_argument("node", nargs="?", default=None,
@@ -485,7 +500,8 @@ def main() -> None:
         p.add_argument("--" + key.replace("_", "-"),
                        type=int if key in SOLVE_INT_KEYS else float,
                        default=None,
-                       help=f"box_carry solve param (default: {val})")
+                       help=f"SBMPC solve param, box_carry/ground_pick "
+                            f"(default: {val})")
     p.set_defaults(func=cmd_solve)
     p = sub.add_parser("panel", help="interactive viser panel: reconstruct + "
                                      "solve with tunable hyperparams")

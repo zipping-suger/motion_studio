@@ -1,9 +1,9 @@
 """The original task, wrapped: hindsight box reconstruction + SBMPC solve.
 
-Thin adapter — the science stays where it always was (studio.recon,
-studio.solve); this module only shapes it to the Task interface. The
-defaults are the very dicts config.load_config() mutates, so config.yml's
-top-level ``scene:`` / ``solve:`` sections keep working unchanged.
+A thin adapter onto the Task interface; the science lives in
+studio.recon / studio.solve. The defaults are the very dicts
+config.load_config() mutates, so config.yml's top-level ``scene:`` /
+``solve:`` sections keep working unchanged.
 """
 
 from .. import recon, solve

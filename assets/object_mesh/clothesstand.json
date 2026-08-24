@@ -1,0 +1,47 @@
+{
+  "name": "clothesstand",
+  "obj_file": "clothesstand_cleaned_simplified.obj",
+  "mesh_scale": 0.270564,
+  "mesh_quat": [
+    -0.078224,
+    0.534717,
+    -0.537268,
+    0.647535
+  ],
+  "mesh_pos": [
+    0.1443,
+    0.0494,
+    0.843
+  ],
+  "height": 1.7481,
+  "handle_radius": 0.0186,
+  "handle_z": [
+    0.0874,
+    0.8303
+  ],
+  "grab_z": [
+    0.1374,
+    0.7803
+  ],
+  "base": {
+    "kind": "cylinder",
+    "radius": 0.193,
+    "half_height": 0.0259,
+    "center": [
+      0.0,
+      0.0,
+      0.0259
+    ]
+  },
+  "mass": 2.5,
+  "com": [
+    0.0103,
+    -0.0028,
+    0.5287
+  ],
+  "inertia_per_mass": [
+    0.35861,
+    0.35989,
+    0.00964
+  ]
+}

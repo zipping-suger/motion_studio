@@ -1,6 +1,6 @@
-"""Smoothing shared by grasp detection, the interaction graph, and the
-object trajectory. Kept in one place because the exact filter matters:
-detection thresholds are tuned against these window widths."""
+"""Smoothing shared by grasp detection, the interaction graph and the
+object trajectory. In one place because detection thresholds are tuned
+against these exact window widths."""
 
 import numpy as np
 

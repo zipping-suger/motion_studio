@@ -1,24 +1,17 @@
 """Interactive tuning panel: reconstruct + solve from viser buttons.
 
-Pick a motion from raw_motion/ (where the demo's local motion saves
-land) — it previews immediately — and pick the downstream task:
+Pick a motion from raw_motion/ — it previews immediately — and pick the
+downstream task. Button 1 reconstructs the scene with the params set in
+the GUI, button 2 solves it: box_carry, ground_pick and pole run
+studio.solve, the obstacle tasks (under_table, kick) run
+studio.solve.mppi_loop. Then watch reference (transparent) vs solution
+(solid) playback.
 
-- box_carry: click "1. Reconstruct scene" (studio.recon with the scene
-  params set in the GUI, same controls as the demo's "Scene recon" folder,
-  including allow held start), inspect the reconstruction, tune SBMPC
-  hyperparameters, click "2. Solve SBMPC" (studio.solve).
-- under_table / kick (the obstacle tasks): click button 1 to build the
-  seeded scene (a table over the duck, or a box in the kicking foot's
-  path; change the seed / difficulty knobs and re-estimate), then
-  "2. Solve MPPI" (studio.solve.mppi_loop).
-
-Either way, watch reference (transparent) vs solution (solid) playback.
 Every action works inside an ordinary studio run dir (runs/<name>/), so
 list/view/promote all apply.
 
 Runs in the solve venv, which has viser + mujoco + SPIDER: launch with
-`studio panel`, or `studio view <run>` to open an existing run (the run's
-recorded task picks the mode).
+`studio panel`, or `studio view <run>` to open an existing run.
 """
 
 import argparse
@@ -40,11 +33,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling scripts
 
 from studio import manifest, recon, shim, solve, viz
 from studio import tasks as studio_tasks
-from studio.config import (RAW_MOTION_DIR, RUNS_DIR, SCENE_DEFAULTS,
+from studio.config import (PICK_GRASPS, PICK_SCENE_DEFAULTS, PICK_SHAPES,
+                           POLE_OBJECTS, POLE_SCENE_DEFAULTS,
+                           RAW_MOTION_DIR, RUNS_DIR, SCENE_DEFAULTS,
                            SOLVE_DEFAULTS, SOLVE_INT_KEYS, load_config,
                            task_dirs)
 from studio.recon.grasp import (BOX_WIDTH_MAX, BOX_WIDTH_MIN,
                                 HAND_SURFACE_OFFSET, detect_grasp)
+from studio.recon import layout
+from studio.recon import pick as recon_pick
+from studio.recon import pole as recon_pole
 from studio.recon.loader import (DOF_NAMES, KIM_LEFT_HAND_TIP,
                                  KIM_RIGHT_HAND_TIP, load_kimodo_npz)
 from studio.recon.signal import smooth
@@ -56,12 +54,15 @@ from viser.extras import ViserUrdf
 import yourdfpy
 
 CFG = load_config()
-G1_URDF = str(recon.assets.G1_URDF)
+# the BrainCo-hand model when its assets are installed, else the handless
+# 29-DoF URDF. The motion drives the same 29 body DOFs either way; finger
+# joints follow a trial's qpos and hold rest in raw previews.
+G1_URDF = str(recon.assets.G1_BRAINCO_URDF
+              if recon.assets.brainco_available() else recon.assets.G1_URDF)
 MESHES_DIR = str(recon.assets.MESHES_DIR)
 
-# The obstacle tasks the panel drives, and which of their params it
-# exposes (the full sets live in the *_params modules; everything not
-# shown solves at its default).
+# the obstacle tasks the panel drives and the params it exposes; the full
+# sets live in the *_params modules and everything else stays default
 OBSTACLE_TASKS = {
     "under_table": {
         "params": under_table_params,
@@ -88,20 +89,29 @@ OBSTACLE_TASKS = {
                        "stability_weight", "leg_noise_scale", "qw_legs"),
     },
 }
-# first primitive (slab / the kick box) darker, the rest (table legs)
-# lighter — mirrors the injected scene rgba
+# first primitive (slab / kick box) darker, table legs lighter, mirroring
+# the injected scene rgba
 OBSTACLE_COLORS = [(140, 89, 51), (115, 71, 38)]
 
 
+# lh/rh palms plus, on the BrainCo model, the per-finger-segment capsules
+HAND_GEOM_RE = re.compile(r"^[lr]h(_|$)")
+
+
 def hand_collision_geoms(scene_xml, qpos_traj):
-    """World poses of the lh/rh collision geoms via FK (view_trial.py)."""
+    """Names, meshes and world poses (via FK) of the full hand collision
+    set — palm box/hull + finger-segment capsules. This is the actual
+    contact model the solve grasps with, so the overlay must show all of
+    it, not just the palms."""
     m = mujoco.MjModel.from_xml_path(str(scene_xml))
     d = mujoco.MjData(m)
-    gids = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, g)
-            for g in ("lh", "rh")]
+    geoms = [(n, g) for g in range(m.ngeom)
+             if HAND_GEOM_RE.match(
+                 n := mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g) or "")]
     meshes = []
-    for gid, side in zip(gids, ("left", "right")):
+    for name, gid in geoms:
         if m.geom_type[gid] == mujoco.mjtGeom.mjGEOM_MESH:
+            side = "left" if name[0] == "l" else "right"
             hand = trimesh.load(f"{MESHES_DIR}/{side}_rubber_hand.STL")
             hull = trimesh.convex.convex_hull(hand)
             mid = m.geom_dataid[gid]
@@ -109,27 +119,66 @@ def hand_collision_geoms(scene_xml, qpos_traj):
             mujoco.mju_quat2Mat(R, m.mesh_quat[mid])
             hull.vertices = (hull.vertices - m.mesh_pos[mid]) @ R.reshape(3, 3)
             meshes.append(hull)
+        elif m.geom_type[gid] == mujoco.mjtGeom.mjGEOM_BOX:
+            # the BrainCo template's lh/rh palm boxes
+            meshes.append(trimesh.creation.box(2 * m.geom_size[gid]))
         else:
             radius, half_len = m.geom_size[gid][0], m.geom_size[gid][1]
             meshes.append(trimesh.creation.capsule(radius=radius,
                                                    height=2 * half_len))
-    poses = np.zeros((len(qpos_traj), 2, 7))
+    poses = np.zeros((len(qpos_traj), len(geoms), 7))
     quat = np.zeros(4)
     for t, qp in enumerate(qpos_traj):
         d.qpos[:] = qp
         mujoco.mj_forward(m, d)
-        for k, gid in enumerate(gids):
+        for k, (_n, gid) in enumerate(geoms):
             poses[t, k, :3] = d.geom_xpos[gid]
             mujoco.mju_mat2Quat(quat, d.geom_xmat[gid].ravel())
             poses[t, k, 3:] = quat
-    return meshes, poses
+    return [n for n, _ in geoms], meshes, poses
+
+
+def object_collision_geoms(scene_xml):
+    """The object's PHYSICAL model: every collision geom on the free
+    object body — the handle capsule + base primitive of a pole trial,
+    the (squeeze-widened) box of box_carry, the pick object's primitive
+    — as (names, meshes, offsets), offsets being each geom's static
+    body-frame (pos, wxyz quat). The OMOMO visual mesh is excluded: the
+    point of the overlay is seeing exactly what physics can collide
+    with, next to the visual it diverges from (legs, hooks and shades
+    have no collision geom at all)."""
+    m = mujoco.MjModel.from_xml_path(str(scene_xml))
+    bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "largebox")
+    names, meshes, offsets = [], [], []
+    if bid < 0:
+        return names, meshes, offsets
+    builders = {
+        mujoco.mjtGeom.mjGEOM_BOX:
+            lambda s: trimesh.creation.box(2 * s),
+        mujoco.mjtGeom.mjGEOM_CAPSULE:
+            lambda s: trimesh.creation.capsule(radius=s[0], height=2 * s[1]),
+        mujoco.mjtGeom.mjGEOM_CYLINDER:
+            lambda s: trimesh.creation.cylinder(radius=s[0], height=2 * s[1]),
+        mujoco.mjtGeom.mjGEOM_SPHERE:
+            lambda s: trimesh.creation.icosphere(radius=s[0]),
+    }
+    for g in range(m.ngeom):
+        build = builders.get(m.geom_type[g])
+        if m.geom_bodyid[g] != bid or build is None:
+            continue  # the visual mesh, or an unknown primitive
+        names.append(mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g)
+                     or f"geom{g}")
+        meshes.append(build(m.geom_size[g]))
+        offsets.append((m.geom_pos[g].copy(), m.geom_quat[g].copy()))
+    return names, meshes, offsets
 
 
 def list_sources():
-    # the demo's local motion saves land in raw_motion/ — that dir is the
-    # panel's single source of inputs
+    # inputs all come from raw_motion/: demo saves at its top level, batch
+    # clips in subdirs. Keyed by relative path so equal stems stay distinct.
     RAW_MOTION_DIR.mkdir(exist_ok=True)
-    return {f.stem: f for f in sorted(RAW_MOTION_DIR.glob("*.npz"))}
+    return {str(f.relative_to(RAW_MOTION_DIR).with_suffix("")): f
+            for f in sorted(RAW_MOTION_DIR.rglob("*.npz"))}
 
 
 class Panel:
@@ -141,8 +190,19 @@ class Panel:
         self.res_qpos = None
         self.hand_poses = None
         self.hand_handles = []
+        self.obj_col_handles = []   # object PHYSICAL-model overlay
+        self.obj_col_offsets = []   # matching body-frame (pos, quat)
         self.scene_handles = []
         self.busy = False
+        # published ref/res layout: raw previews use the 36-wide body
+        # contract, trial files the model layout (studio.recon.layout).
+        # q_addr maps the 29 body joints out of a model-layout frame;
+        # joint_addr maps EVERY URDF joint so trial playback shows the
+        # grasp closure the qpos carries.
+        self.q_addr = None
+        self.joint_addr = None
+        self.ref_has_box = False
+        self.res_has_box = False
         # contact-window preview state (only while previewing a raw motion)
         self.auto_window = None     # (pick, release) as detected
         self.ghost = None           # {"pick","rel"} — publish LAST
@@ -169,8 +229,48 @@ class Panel:
             kwargs["mesh_color_override"] = (0.5, 0.5, 0.8, alpha)
         vis = ViserUrdf(self.server, urdf_model, root_node_name=f"/{name}",
                         **kwargs)
-        order = [DOF_NAMES.index(n) for n in urdf_model.actuated_joint_names]
-        return base, vis, order
+        # qpos index per actuated joint; None for the BrainCo fingers,
+        # which the body-contract motion does not drive and _cfg rests
+        self.joint_names = list(urdf_model.actuated_joint_names)
+        order = [DOF_NAMES.index(n) if n in DOF_NAMES else None
+                 for n in self.joint_names]
+        rest = np.zeros(len(order))
+        for k, n in enumerate(self.joint_names):
+            lim = urdf_model.joint_map[n].limit
+            if lim is not None:  # some finger tips pin at 1.0 rad
+                rest[k] = np.clip(0.0, lim.lower, lim.upper)
+        return base, vis, (order, rest)
+
+    def _cfg(self, frame):
+        """update_cfg vector from a qpos frame in either layout. Body DOFs
+        come from the motion; the BrainCo finger joints follow the frame
+        when the trial's model carries them — that is the grasp closure —
+        and hold rest for raw body-contract previews."""
+        order, rest = self.order
+        if frame.shape[-1] != layout.BODY_NQ and self.joint_addr is not None:
+            return np.array([rest[k] if a is None else frame[a]
+                             for k, a in enumerate(self.joint_addr)])
+        joints = self._body29(frame)
+        return np.array([rest[k] if i is None else joints[i]
+                         for k, i in enumerate(order)])
+
+    def _body29(self, frame):
+        """The 29 body joint values from a qpos frame in either layout."""
+        if frame.shape[-1] == layout.BODY_NQ:
+            return frame[7:36]
+        return frame[self.q_addr]
+
+    def _load_q_addr(self):
+        """Joint addresses for this trial's model layout: the 29 body
+        joints (_body29) and every URDF joint by name (_cfg, which is how
+        the finger closure in a trial's qpos reaches the rendered hands)."""
+        m = mujoco.MjModel.from_xml_path(str(self.task_dir / "scene.xml"))
+        self.q_addr = layout.body_addr(m)
+        addr = []
+        for name in self.joint_names:
+            jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, name)
+            addr.append(int(m.jnt_qposadr[jid]) if jid >= 0 else None)
+        self.joint_addr = addr
 
     # ------------------------------------------------------------- GUI --
     def _build_gui(self):
@@ -195,8 +295,8 @@ class Panel:
         with self.folder_box_scene:
             self.scene_widgets = viz.scene_param_widgets(gui, SCENE_DEFAULTS)
             self.gui_held = gui.add_checkbox("allow held start", False)
-            # contact window: auto-detected on preview, freely editable;
-            # the ghost box shows the object trajectory it implies
+            # auto-detected on preview, freely editable; the ghost box
+            # shows the object trajectory the window implies
             self.gui_cstart = gui.add_number("contact start", 0, min=0, step=1)
             self.gui_cend = gui.add_number("contact end", 0, min=0, step=1)
             self.btn_auto = gui.add_button("auto window")
@@ -217,6 +317,64 @@ class Panel:
             self.btn_solve.disabled = True
             self.solve_progress = gui.add_progress_bar(0.0, visible=False)
             self.md_solve = gui.add_markdown("*reconstruct first*")
+
+        # ground_pick: object params + box_carry's SBMPC solve controls
+        self.folder_pick = gui.add_folder("ground_pick task", visible=False)
+        with self.folder_pick:
+            self.pick_scene_widgets = {}
+            choices = {"shape": PICK_SHAPES, "grasp": PICK_GRASPS}
+            for key, val in PICK_SCENE_DEFAULTS.items():
+                if key in choices:
+                    self.pick_scene_widgets[key] = gui.add_dropdown(
+                        key, choices[key], initial_value=val)
+                else:
+                    self.pick_scene_widgets[key] = gui.add_number(
+                        key, float(val), min=0.0, step=0.01)
+            self.btn_pick_recon = gui.add_button("1. Reconstruct pick scene")
+            self.md_pick_recon = gui.add_markdown("*no reconstruction yet*")
+            self.pick_solve_widgets = {}
+            for key, val in SOLVE_DEFAULTS.items():
+                if key in SOLVE_INT_KEYS:
+                    self.pick_solve_widgets[key] = gui.add_number(
+                        key, int(val), min=1, step=max(1, int(val) // 16))
+                else:
+                    self.pick_solve_widgets[key] = gui.add_number(
+                        key, float(val), min=0.0, step=0.05)
+            self.btn_pick_solve = gui.add_button("2. Solve SBMPC")
+            self.btn_pick_solve.disabled = True
+            self.pick_progress = gui.add_progress_bar(0.0, visible=False)
+            self.md_pick_solve = gui.add_markdown("*reconstruct first*")
+
+        # pole: object/mode params + the same SBMPC solve controls
+        self.folder_pole = gui.add_folder("pole task", visible=False)
+        with self.folder_pole:
+            self.pole_scene_widgets = {}
+            choices = {"object": POLE_OBJECTS, "grasp": PICK_GRASPS}
+            for key, val in POLE_SCENE_DEFAULTS.items():
+                if key in choices:
+                    self.pole_scene_widgets[key] = gui.add_dropdown(
+                        key, choices[key], initial_value=val)
+                elif isinstance(val, str):
+                    # free-form: auto | off | S-E frames
+                    self.pole_scene_widgets[key] = gui.add_text(
+                        key, initial_value=val)
+                else:
+                    self.pole_scene_widgets[key] = gui.add_number(
+                        key, float(val), min=0.0, step=0.01)
+            self.btn_pole_recon = gui.add_button("1. Reconstruct pole scene")
+            self.md_pole_recon = gui.add_markdown("*no reconstruction yet*")
+            self.pole_solve_widgets = {}
+            for key, val in SOLVE_DEFAULTS.items():
+                if key in SOLVE_INT_KEYS:
+                    self.pole_solve_widgets[key] = gui.add_number(
+                        key, int(val), min=1, step=max(1, int(val) // 16))
+                else:
+                    self.pole_solve_widgets[key] = gui.add_number(
+                        key, float(val), min=0.0, step=0.05)
+            self.btn_pole_solve = gui.add_button("2. Solve SBMPC")
+            self.btn_pole_solve.disabled = True
+            self.pole_progress = gui.add_progress_bar(0.0, visible=False)
+            self.md_pole_solve = gui.add_markdown("*reconstruct first*")
 
         self.obs = {}
         for tname, tcfg in OBSTACLE_TASKS.items():
@@ -256,6 +414,20 @@ class Panel:
             self._frame_order = self.gui_frame.order
             self.gui_play = gui.add_checkbox("play", True)
             self.gui_speed = gui.add_slider("speed", 0.1, 2.0, 0.1, 1.0)
+            # stacked reference/result playback is hard to read: hide
+            # either side, or the yellow hand geoms, to see the other
+            self.gui_show_ref = gui.add_checkbox("show reference", True)
+            self.gui_show_res = gui.add_checkbox("show result", True)
+            self.gui_show_hands = gui.add_checkbox("show hand collision",
+                                                   True)
+            # the object's PHYSICAL model: handle capsule + base
+            # primitive, since the visual mesh has no collision
+            self.gui_show_objcol = gui.add_checkbox("show object collision",
+                                                    False)
+
+        for w in (self.gui_show_ref, self.gui_show_res, self.gui_show_hands,
+                  self.gui_show_objcol):
+            w.on_update(lambda _e: self._apply_visibility())
 
         @self.gui_source.on_update
         def _(_):
@@ -302,6 +474,22 @@ class Panel:
         def _(_):
             self._spawn(self.do_solve)
 
+        @self.btn_pick_recon.on_click
+        def _(_):
+            self._spawn(self.do_reconstruct_pick)
+
+        @self.btn_pick_solve.on_click
+        def _(_):
+            self._spawn(self.do_solve_pick)
+
+        @self.btn_pole_recon.on_click
+        def _(_):
+            self._spawn(self.do_reconstruct_pole)
+
+        @self.btn_pole_solve.on_click
+        def _(_):
+            self._spawn(self.do_solve_pole)
+
         for tname, h in self.obs.items():
             # bind the task name per closure, not per loop variable
             h["btn_recon"].on_click(
@@ -318,8 +506,34 @@ class Panel:
         box = active == "box_carry"
         self.folder_box_scene.visible = box
         self.folder_box_solve.visible = box
+        self.folder_pick.visible = active == "ground_pick"
+        self.folder_pole.visible = active == "pole"
         for tname, h in self.obs.items():
             h["folder"].visible = tname == active
+
+    def _apply_visibility(self):
+        """Reference / result / hand-overlay visibility from the playback
+        toggles. Called on toggle and at the end of every load, so a
+        hidden side stays hidden across reconstructs and solves."""
+        try:
+            self.ref_base.visible = (self.gui_show_ref.value
+                                     and self.ref_qpos is not None)
+            if self.ref_box is not None:
+                self.ref_box.visible = self.gui_show_ref.value
+            show_res = self.gui_show_res.value and self.res_qpos is not None
+            if self.res_base is not None:
+                self.res_base.visible = show_res
+            if self.res_box is not None:
+                self.res_box.visible = show_res
+            show_hands = (self.gui_show_hands.value
+                          and self.res_qpos is not None)
+            for h in self.hand_handles:
+                h.visible = show_hands
+            for h in self.obj_col_handles:
+                h.visible = self.gui_show_objcol.value
+        except RuntimeError:
+            pass  # a worker replaced a handle mid-toggle; the load that
+            # replaced it calls this again with the fresh handles
 
     def _reset_frame_slider(self, T: int):
         """Slider bounds are immutable in viser — recreate the frame slider
@@ -339,6 +553,10 @@ class Panel:
         self.btn_recon.disabled = busy
         self.gui_task.disabled = busy
         self.btn_solve.disabled = busy or self.task_dir is None
+        self.btn_pick_recon.disabled = busy
+        self.btn_pick_solve.disabled = busy or self.task_dir is None
+        self.btn_pole_recon.disabled = busy
+        self.btn_pole_solve.disabled = busy or self.task_dir is None
         for h in self.obs.values():
             h["btn_recon"].disabled = busy
             h["btn_solve"].disabled = busy or self.task_dir is None
@@ -356,9 +574,11 @@ class Panel:
             self.res_qpos = None
             self.task_dir = None  # solve needs a fresh reconstruction
             self._clear_ghost()
-            for h in self.scene_handles + self.hand_handles:
+            for h in (self.scene_handles + self.hand_handles
+                      + self.obj_col_handles):
                 h.remove()
             self.scene_handles, self.hand_handles = [], []
+            self.obj_col_handles, self.obj_col_offsets = [], []
             if self.res_base is not None:
                 self.res_base.visible = False
             if self.res_box is not None:
@@ -367,9 +587,10 @@ class Panel:
             if self.ref_box is not None:
                 self.ref_box.remove()
                 self.ref_box = None
-            self.ref_base.visible = True
             self._reset_frame_slider(len(qpos))
+            self.ref_has_box = False  # raw preview: body contract, no box
             self.ref_qpos = qpos  # publish LAST
+            self._apply_visibility()
 
             if self.gui_task.value in self.obs:
                 # no ghost box / contact window in obstacle modes: the
@@ -383,8 +604,46 @@ class Panel:
                 h["md_solve"].content = "*build the scene first*"
                 return
 
-            # detect the contact window + precompute the hand-midpoint
-            # track for the ghost box (mirrors build_object_trajectory)
+            if self.gui_task.value == "ground_pick":
+                # no ghost box either: the object spawns where the picking
+                # hand bottoms out, which the detector reports here
+                self._mid = self._yaw = self._gap = None
+                self.auto_window = None
+                try:
+                    info = recon_pick.detect_pick(meta)
+                    detail = (f"{info.hand} hand pick f{info.pick_frame} "
+                              f"reach {info.reach_height:.2f} "
+                              f"lift {info.lift_height:.2f} "
+                              f"flags [{','.join(info.quality_flags) or '-'}]")
+                except Exception as e:
+                    detail = f"pick detection failed: {e}"
+                self.md_pick_recon.content = (
+                    f"*previewing `{source.stem}` ({len(qpos)} frames) — "
+                    f"{detail}*")
+                self.md_pick_solve.content = "*reconstruct first*"
+                return
+
+            if self.gui_task.value == "pole":
+                # no ghost box: the pole spawns under the holding hands'
+                # grasp pockets, which the detector reports here
+                self._mid = self._yaw = self._gap = None
+                self.auto_window = None
+                try:
+                    info = recon_pole.detect_pole_hold(meta, qpos)
+                    detail = (f"{'+'.join(info.hands)} hold "
+                              f"f{info.grab_frame}-f{info.end_frame} "
+                              f"transport {info.transport:.2f} "
+                              f"flags [{','.join(info.quality_flags) or '-'}]")
+                except Exception as e:
+                    detail = f"hold detection failed: {e}"
+                self.md_pole_recon.content = (
+                    f"*previewing `{source.stem}` ({len(qpos)} frames) — "
+                    f"{detail}*")
+                self.md_pole_solve.content = "*reconstruct first*"
+                return
+
+            # detect the window + precompute the hand-midpoint track for
+            # the ghost box, mirroring build_object_trajectory
             grasp = detect_grasp(meta, qpos, {},
                                  allow_held_start=self.gui_held.value)
             jp = meta["joint_positions"]
@@ -395,8 +654,7 @@ class Panel:
             yaw = smooth(np.unwrap(np.arctan2(axis[:, 1], axis[:, 0])), 9)
             self._gap = np.linalg.norm(lh - rh, axis=1)
             self._mid, self._yaw = mid, yaw
-            # default window = full clip; the detected window is one
-            # "auto window" click away
+            # default is the full clip; detected is one click away
             self.auto_window = (grasp.pick_frame, grasp.release_frame)
             T = len(qpos)
             self._suppress_window_cb = True
@@ -414,6 +672,7 @@ class Panel:
             self.md_solve.content = "*reconstruct first*"
         except Exception as e:
             self.md_recon.content = f"**preview failed**: {e}"
+            self.md_pick_recon.content = f"**preview failed**: {e}"
             for h in self.obs.values():
                 h["md_recon"].content = f"**preview failed**: {e}"
         finally:
@@ -466,9 +725,9 @@ class Panel:
                 scene_params["allow_held_start"] = True
             pick = int(self.gui_cstart.value)
             rel = int(self.gui_cend.value)
-            # only force the window when the user moved it off the detected
-            # values — the detector's own window end differs from release,
-            # so a no-op override would still shift the width slightly
+            # only force the window when the user moved it off the
+            # detected values: the detector's window end differs from
+            # release, so a no-op override would still shift the width
             override = (self.auto_window is not None
                         and (pick, rel) != self.auto_window)
             if override:
@@ -503,13 +762,15 @@ class Panel:
         info = viz.read_info(self.task_dir)
         ref_qpos = np.load(
             self.task_dir / "0/trajectory_kinematic.npz")["qpos"]
-        # unpublish first: tick() runs concurrently in the main thread and
-        # must not touch handles while they are being rebuilt
+        # unpublish first: tick() runs in the main thread and must not
+        # touch handles while they are being rebuilt
         self.ref_qpos = None
         self.res_qpos = None
-        for h in self.scene_handles + self.hand_handles:
+        for h in (self.scene_handles + self.hand_handles
+                  + self.obj_col_handles):
             h.remove()
         self.scene_handles, self.hand_handles = [], []
+        self.obj_col_handles, self.obj_col_offsets = [], []
         if self.res_base is not None:
             self.res_base.visible = False
         if self.res_box is not None:
@@ -520,37 +781,155 @@ class Panel:
 
         if self.ref_box is not None:
             self.ref_box.remove()
-        self._box_mesh = viz.box_mesh(info)
+        self._box_mesh = viz.object_mesh(info)
         self.ref_box = self.server.scene.add_mesh_simple(
             "/ref_box", self._box_mesh.vertices, self._box_mesh.faces,
             color=(200, 60, 60), opacity=0.4,
-            position=ref_qpos[0, 36:39], wxyz=ref_qpos[0, 39:43])
-        self.ref_base.visible = True
+            position=ref_qpos[0, -7:-4], wxyz=ref_qpos[0, -4:])
+
+        # the object's PHYSICAL model, toggled from the playback folder;
+        # rides the shown pose in tick() (a free joint, so static geom
+        # offsets compose with qpos[-7:] and no per-frame FK is needed)
+        oc_names, oc_meshes, oc_offsets = object_collision_geoms(
+            self.task_dir / "scene.xml")
+        for k, name in enumerate(oc_names):
+            self.obj_col_handles.append(self.server.scene.add_mesh_simple(
+                f"/objcol_{name}", oc_meshes[k].vertices,
+                oc_meshes[k].faces, color=(60, 120, 220), opacity=0.55,
+                position=ref_qpos[0, -7:-4], wxyz=ref_qpos[0, -4:],
+                visible=self.gui_show_objcol.value))
+        self.obj_col_offsets = oc_offsets
         self._reset_frame_slider(len(ref_qpos))
+        self._load_q_addr()
+        self.ref_has_box = True  # model layout, box joint last
         self.ref_qpos = ref_qpos  # publish LAST: handles are complete now
+        self._apply_visibility()
+
+    # ---------------------------------------------- ground_pick recon --
+    def do_reconstruct_pick(self):
+        """Build a ground_pick trial. The trial keeps box_carry's contract
+        (object free joint last), so reference/result rendering is the
+        box path — only the object mesh differs."""
+        source = self.sources.get(self.gui_source.value)
+        if source is None:
+            return
+        self._set_busy(True)
+        self.md_pick_recon.content = "**reconstructing ...** (takes ~10-20 s)"
+        try:
+            # own run name: a box_carry run of the same clip may coexist
+            name = shim.sanitize(f"{source.stem}_gp")
+            run_dir = RUNS_DIR / name
+            run_dir.mkdir(parents=True, exist_ok=True)
+            motion_dir = shim.shim_motion_npz(source, run_dir)
+            npz = motion_dir / f"{name}_00.npz"
+
+            scene_params = {k: w.value
+                            for k, w in self.pick_scene_widgets.items()}
+            task_obj = studio_tasks.load("ground_pick")
+            try:
+                task_dir, line = task_obj.reconstruct(
+                    npz, run_dir / "outputs", f"{name}_00",
+                    {"scene_params": scene_params})
+            except Exception as e:
+                self.md_pick_recon.content = f"**reconstruction crashed**: {e}"
+                self.task_dir = None
+                return
+            if task_dir is None:
+                self.md_pick_recon.content = (
+                    f"**failed/skipped**\n```\n{line}\n```")
+                self.task_dir = None
+                return
+            self.run_dir, self.task_dir = run_dir, task_dir
+            manifest.update(run_dir, {
+                "name": name, "source": str(source),
+                "task_type": "ground_pick", "verdict": "recon",
+                "panel_scene_params": scene_params})
+            self._load_reference()
+            self.md_pick_recon.content = f"```\n{line.split(' -> ')[0]}\n```"
+            self.md_pick_solve.content = "*ready to solve*"
+        finally:
+            self._set_busy(False)
+
+    # ---------------------------------------------------- pole recon --
+    def do_reconstruct_pole(self):
+        """Build a pole trial. The trial keeps box_carry's contract
+        (object free joint last), so reference/result rendering is the
+        box path — only the object mesh differs."""
+        source = self.sources.get(self.gui_source.value)
+        if source is None:
+            return
+        self._set_busy(True)
+        self.md_pole_recon.content = "**reconstructing ...** (takes ~10-30 s)"
+        try:
+            # own run name: a box_carry run of the same clip may coexist
+            name = shim.sanitize(f"{source.stem}_pole")
+            run_dir = RUNS_DIR / name
+            run_dir.mkdir(parents=True, exist_ok=True)
+            motion_dir = shim.shim_motion_npz(source, run_dir)
+            npz = motion_dir / f"{name}_00.npz"
+
+            scene_params = {k: w.value
+                            for k, w in self.pole_scene_widgets.items()}
+            task_obj = studio_tasks.load("pole")
+            try:
+                task_dir, line = task_obj.reconstruct(
+                    npz, run_dir / "outputs", f"{name}_00",
+                    {"scene_params": scene_params})
+            except Exception as e:
+                self.md_pole_recon.content = f"**reconstruction crashed**: {e}"
+                self.task_dir = None
+                return
+            if task_dir is None:
+                self.md_pole_recon.content = (
+                    f"**failed/skipped**\n```\n{line}\n```")
+                self.task_dir = None
+                return
+            self.run_dir, self.task_dir = run_dir, task_dir
+            manifest.update(run_dir, {
+                "name": name, "source": str(source),
+                "task_type": "pole", "verdict": "recon",
+                "panel_scene_params": scene_params})
+            self._load_reference()
+            self.md_pole_recon.content = f"```\n{line.split(' -> ')[0]}\n```"
+            self.md_pole_solve.content = "*ready to solve*"
+        finally:
+            self._set_busy(False)
 
     # ----------------------------------------------------------- solve --
     def do_solve(self):
+        self._solve_mjwp(self.solve_widgets, self.solve_progress,
+                         self.md_solve)
+
+    def do_solve_pick(self):
+        self._solve_mjwp(self.pick_solve_widgets, self.pick_progress,
+                         self.md_pick_solve)
+
+    def do_solve_pole(self):
+        self._solve_mjwp(self.pole_solve_widgets, self.pole_progress,
+                         self.md_pole_solve)
+
+    def _solve_mjwp(self, widgets, progress, md):
+        """The SBMPC solve + evaluation, shared by the box_carry and
+        ground_pick modes (same solver, different GUI handles)."""
         if self.task_dir is None:
             return
         self._set_busy(True)
         task = self.task_dir.name
-        params = {k: w.value for k, w in self.solve_widgets.items()}
+        params = {k: w.value for k, w in widgets.items()}
         logs = self.run_dir / "logs"
         logs.mkdir(exist_ok=True)
         log_path = logs / f"solve_{task}.log"
         t0 = time.time()
-        self.md_solve.content = "solving ..."
-        # animated until the first receding-horizon step reports: warp
+        md.content = "solving ..."
+        # animated until the first receding-horizon step reports; warp
         # kernel compilation runs first and emits no progress
-        self.solve_progress.value = 0.0
-        self.solve_progress.animated = True
-        self.solve_progress.visible = True
+        progress.value = 0.0
+        progress.animated = True
+        progress.visible = True
         try:
             proc = subprocess.Popen(
                 solve.command(CFG, task, self.run_dir / "outputs", params),
-                # unbuffered child: progress prints must reach the pipe per
-                # line, not in one burst at exit
+                # unbuffered child, so progress reaches the pipe per line
                 env={**os.environ, **solve.env(), "PYTHONUNBUFFERED": "1"},
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             final = ""
@@ -563,16 +942,15 @@ class Panel:
                     m = prog_re.search(line)
                     if m:
                         cur, tot = int(m.group(1)), int(m.group(2))
-                        self.solve_progress.animated = False
-                        self.solve_progress.value = 100.0 * cur / max(tot, 1)
-                        self.md_solve.content = (
+                        progress.animated = False
+                        progress.value = 100.0 * cur / max(tot, 1)
+                        md.content = (
                             f"solving ... {time.time() - t0:.0f}s "
                             f"({cur}/{tot} sim steps)")
                     elif i % 25 == 0:
-                        self.md_solve.content = (
-                            f"solving ... {time.time() - t0:.0f}s")
+                        md.content = f"solving ... {time.time() - t0:.0f}s"
             if proc.wait() != 0:
-                self.md_solve.content = f"**solve failed** — see {log_path}"
+                md.content = f"**solve failed** — see {log_path}"
                 return
             self._load_result()
             metrics = solve.evaluate.evaluate_task(self.task_dir)
@@ -581,36 +959,37 @@ class Panel:
                 "solve_params": params,
                 "verdict": solve.evaluate.verdict([(task, metrics)]),
                 "eval_rows": [row]})
-            self.md_solve.content = (f"**{time.time() - t0:.0f}s** — {final}\n"
-                                     f"```\n{row}\n```")
+            md.content = (f"**{time.time() - t0:.0f}s** — {final}\n"
+                          f"```\n{row}\n```")
         finally:
-            self.solve_progress.visible = False
+            progress.visible = False
             self._set_busy(False)
 
     def _load_result(self):
-        res_qpos = np.load(
-            self.task_dir / "0/trajectory_mjwp.npz")["qpos"].reshape(-1, 43)
+        arr = np.load(self.task_dir / "0/trajectory_mjwp.npz")["qpos"]
+        res_qpos = arr.reshape(-1, arr.shape[-1])  # (ticks*steps, nq)
         if self.res_base is None:
             self.res_base, self.res_vis, _ = self._add_robot("res_robot")
-        self.res_base.visible = True
         if self.res_box is not None:
             self.res_box.remove()
         self.res_box = self.server.scene.add_mesh_simple(
             "/res_box", self._box_mesh.vertices, self._box_mesh.faces,
-            color=(60, 180, 60), position=res_qpos[0, 36:39],
-            wxyz=res_qpos[0, 39:43])
+            color=(60, 180, 60), position=res_qpos[0, -7:-4],
+            wxyz=res_qpos[0, -4:])
         for h in self.hand_handles:
             h.remove()
         hand_handles = []
-        hand_meshes, hand_poses = hand_collision_geoms(
+        hand_names, hand_meshes, hand_poses = hand_collision_geoms(
             self.task_dir / "scene.xml", res_qpos)
-        for k, side in enumerate(("lh", "rh")):
+        for k, name in enumerate(hand_names):
             hand_handles.append(self.server.scene.add_mesh_simple(
-                f"/hand_{side}", hand_meshes[k].vertices, hand_meshes[k].faces,
+                f"/hand_{name}", hand_meshes[k].vertices, hand_meshes[k].faces,
                 color=(230, 180, 40), opacity=0.6,
                 position=hand_poses[0, k, :3], wxyz=hand_poses[0, k, 3:]))
         self.hand_handles, self.hand_poses = hand_handles, hand_poses
+        self.res_has_box = True
         self.res_qpos = res_qpos  # publish LAST: handles are complete now
+        self._apply_visibility()
 
     # --------------------------------------- obstacle-task reconstruct --
     def do_reconstruct_obs(self, tname: str):
@@ -659,15 +1038,17 @@ class Panel:
         self._clear_ghost()
         info = json.loads((self.task_dir / "task_info.json").read_text())
         ref_qpos = np.load(
-            self.task_dir / "0/trajectory_kinematic.npz")["qpos"]  # (T, 36)
-        # unpublish first: tick() runs concurrently in the main thread and
-        # must not touch handles while they are being rebuilt
+            self.task_dir / "0/trajectory_kinematic.npz")["qpos"]  # (T, nq)
+        # unpublish first: tick() runs in the main thread and must not
+        # touch handles while they are being rebuilt
         self.ref_qpos = None
         self.res_qpos = None
         self.hand_poses = None
-        for h in self.scene_handles + self.hand_handles:
+        for h in (self.scene_handles + self.hand_handles
+                  + self.obj_col_handles):
             h.remove()
         self.scene_handles, self.hand_handles = [], []
+        self.obj_col_handles, self.obj_col_offsets = [], []
         if self.res_base is not None:
             self.res_base.visible = False
         for attr in ("res_box", "ref_box"):
@@ -686,9 +1067,11 @@ class Panel:
                 f"/obstacle_{i}", mesh.vertices, mesh.faces, color=color,
                 opacity=0.9, position=np.asarray(pos, dtype=np.float64),
                 wxyz=(np.cos(half), 0.0, 0.0, np.sin(half))))
-        self.ref_base.visible = True
         self._reset_frame_slider(len(ref_qpos))
+        self._load_q_addr()
+        self.ref_has_box = False  # robot-only model layout
         self.ref_qpos = ref_qpos  # publish LAST: handles are complete now
+        self._apply_visibility()
 
     # ------------------------------------------------ obstacle-task solve --
     def do_solve_obs(self, tname: str):
@@ -704,7 +1087,7 @@ class Panel:
         log_path = logs / f"solve_{task}.log"
         t0 = time.time()
         h["md_solve"].content = "solving ..."
-        # animated until the first receding-horizon step reports: warp
+        # animated until the first receding-horizon step reports; warp
         # kernel compilation runs first and emits no progress
         h["progress"].value = 0.0
         h["progress"].animated = True
@@ -751,12 +1134,13 @@ class Panel:
 
     def _load_result_obs(self):
         res_qpos = np.load(
-            self.task_dir / "0/trajectory_aug.npz")["aug_qpos"]  # (S, 36)
+            self.task_dir / "0/trajectory_aug.npz")["aug_qpos"]  # (S, nq)
         if self.res_base is None:
             self.res_base, self.res_vis, _ = self._add_robot("res_robot")
-        self.res_base.visible = True
         self.hand_poses = None
+        self.res_has_box = False
         self.res_qpos = res_qpos  # publish LAST
+        self._apply_visibility()
 
     # ------------------------------------------------------ open a run --
     def open_run(self, name: str):
@@ -767,6 +1151,7 @@ class Panel:
         trial_dirs = task_dirs(run_dir)
         if not trial_dirs:
             self.md_recon.content = f"**no built trial under** `{run_dir}`"
+            self.md_pick_recon.content = self.md_recon.content
             for h in self.obs.values():
                 h["md_recon"].content = self.md_recon.content
             return
@@ -794,17 +1179,22 @@ class Panel:
                     f"*opened run* `{name}` ({trial_dirs[0].name})")
                 return
 
+            # box_carry, ground_pick and pole share the load/solve path
+            md_recon, md_solve = {
+                "ground_pick": (self.md_pick_recon, self.md_pick_solve),
+                "pole": (self.md_pole_recon, self.md_pole_solve),
+            }.get(task_type, (self.md_recon, self.md_solve))
             self._load_reference()
             metrics = solve.evaluate.evaluate_task(self.task_dir)
             if metrics is None:
-                self.md_solve.content = "*not solved yet — ready to solve*"
+                md_solve.content = "*not solved yet — ready to solve*"
             else:
                 self._load_result()
-                self.md_solve.content = (
+                md_solve.content = (
                     f"```\n"
                     f"{solve.evaluate.format_row(trial_dirs[0].name, metrics)}"
                     f"\n```")
-            self.md_recon.content = f"*opened run* `{name}` ({trial_dirs[0].name})"
+            md_recon.content = f"*opened run* `{name}` ({trial_dirs[0].name})"
         finally:
             self._set_busy(False)
 
@@ -821,14 +1211,14 @@ class Panel:
         try:
             self.ref_base.position = q[t, :3]
             self.ref_base.wxyz = q[t, 3:7]
-            self.ref_vis.update_cfg(q[t, 7:36][self.order])
-            if q.shape[1] > 36 and ref_box is not None:  # reconstructed ref
-                ref_box.position = q[t, 36:39]
-                ref_box.wxyz = q[t, 39:43]
+            self.ref_vis.update_cfg(self._cfg(q[t]))
+            if self.ref_has_box and ref_box is not None:  # reconstructed ref
+                ref_box.position = q[t, -7:-4]
+                ref_box.wxyz = q[t, -4:]
             g, gb = self.ghost, self.ghost_box
-            if q.shape[1] == 36 and g is not None and gb is not None:
-                # rest at the pick pose, ride the hands inside the window,
-                # freeze at release — build_object_trajectory's rule
+            if q.shape[1] == layout.BODY_NQ and g is not None and gb is not None:
+                # build_object_trajectory's rule: rest at the pick pose,
+                # ride the hands in the window, freeze at release
                 s = min(max(t, g["pick"]), g["rel"])
                 gb.position = self._mid[s]
                 half = self._yaw[s] / 2
@@ -839,14 +1229,34 @@ class Panel:
                 s = min(t * 2, len(r) - 1)  # result 60 Hz vs ref 30
                 self.res_base.position = r[s, :3]
                 self.res_base.wxyz = r[s, 3:7]
-                self.res_vis.update_cfg(r[s, 7:36][self.order])
-                if r.shape[1] > 36 and res_box is not None:  # box result
-                    res_box.position = r[s, 36:39]
-                    res_box.wxyz = r[s, 39:43]
+                self.res_vis.update_cfg(self._cfg(r[s]))
+                if self.res_has_box and res_box is not None:  # box result
+                    res_box.position = r[s, -7:-4]
+                    res_box.wxyz = r[s, -4:]
                 if hand_poses is not None and len(hand_poses) == len(r):
                     for k, h in enumerate(hand_handles):
                         h.position = hand_poses[s, k, :3]
                         h.wxyz = hand_poses[s, k, 3:]
+            # follow the result's object pose when one is shown
+            oc_handles, oc_offsets = self.obj_col_handles, self.obj_col_offsets
+            if oc_handles and self.gui_show_objcol.value:
+                if (r is not None and self.res_has_box
+                        and self.gui_show_res.value):
+                    qo = r[min(t * 2, len(r) - 1), -7:]
+                elif self.ref_has_box:
+                    qo = q[t, -7:]
+                else:
+                    qo = None
+                if qo is not None:
+                    R = np.zeros(9)
+                    mujoco.mju_quat2Mat(R, qo[3:])
+                    R = R.reshape(3, 3)
+                    quat = np.zeros(4)
+                    for k, h in enumerate(oc_handles):
+                        p_off, q_off = oc_offsets[k]
+                        h.position = qo[:3] + R @ p_off
+                        mujoco.mju_mulQuat(quat, qo[3:], q_off)
+                        h.wxyz = quat.copy()
         except RuntimeError:
             # a worker replaced a snapshotted handle mid-frame; the next
             # tick renders the fresh state
@@ -862,8 +1272,8 @@ def main():
     server = viser.ViserServer(port=args.port)
     panel = Panel(server)
     if args.run:
-        # wait out the constructor's initial preview: _spawn would silently
-        # drop the open while the busy flag is held
+        # wait out the constructor's initial preview, or _spawn silently
+        # drops the open while the busy flag is held
         def _open():
             while panel.busy:
                 time.sleep(0.1)

@@ -5,11 +5,10 @@ warp and the SPIDER wheel:
 
     python -m studio.solve.loop --task T --dataset-dir D [--param k=v ...]
 
-Derived from SPIDER's `examples/run_mjwp.py`, trimmed
-to the one configuration studio uses — `humanoid_object`, headless, no
-contact guidance, no Gibbs sampling, no video. `spider_cfg.build` asserts
-that envelope, so a config outside it fails loudly instead of silently
-taking a path this file dropped.
+Derived from SPIDER's `examples/run_mjwp.py`, trimmed to the one
+configuration studio uses — `humanoid_object`, headless, no contact
+guidance, no Gibbs sampling, no video. `spider_cfg.build` asserts that
+envelope.
 
 Three nested loops:
 
@@ -38,7 +37,6 @@ from spider.io import load_data
 from spider.optimizers.sampling import (
     make_optimize_fn,
     make_optimize_once_fn,
-    make_rollout_fn,
 )
 from spider.postprocess.get_success_rate import compute_object_tracking_error
 from spider.simulators.mjwp import (
@@ -46,7 +44,6 @@ from spider.simulators.mjwp import (
     get_qpos,
     get_qvel,
     get_terminate,
-    get_trace,
     load_env_params,
     load_state,
     save_env_params,
@@ -59,30 +56,55 @@ from spider.simulators.mjwp import (
 
 from . import spider_cfg
 from .rewards import make_reward_fns
+from .rollout import make_rollout_fn, skip_zero_perturbation
 
 RESULT_NPZ = "trajectory_mjwp.npz"
 CONFIG_JSON = "solve_config.json"
 
+# endpoint-shaped object tracking (rewards: ref[5]): full end weight for
+# this long past the grab / before the release, then a linear blend down
+END_HOLD_S = 0.4
+END_RAMP_S = 0.4
 
-def _trace_site_ids(mj_model) -> list[int]:
-    """Sites named trace* — object ones first, matching SPIDER's ordering."""
-    object_ids, robot_ids = [], []
-    for sid in range(mj_model.nsite):
-        name = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_SITE, sid)
-        if name and name.startswith("trace"):
-            (object_ids if "object" in name else robot_ids).append(sid)
-    return object_ids + robot_ids
+
+def _obj_weight_profile(config, task_info, n_steps):
+    """Per-sim-step multiplier on the object tracking error.
+
+    The pick and release frames weigh obj_end_rew_scale, the transit
+    between them obj_mid_rew_scale. Flat at the end scale without
+    pick/release frames in task_info, or with equal scales."""
+    import torch
+    end = float(getattr(config, "obj_end_rew_scale", 1.0))
+    mid = float(getattr(config, "obj_mid_rew_scale", 1.0))
+    grab, release = task_info.get("pick_frame"), task_info.get("release_frame")
+    if grab is None or release is None or end == mid:
+        return torch.full((n_steps,), end, device=config.device)
+    k = float(task_info.get("ref_dt", config.sim_dt)) / config.sim_dt
+    hold = END_HOLD_S / config.sim_dt
+    ramp = max(END_RAMP_S / config.sim_dt, 1.0)
+    t = torch.arange(n_steps, device=config.device, dtype=torch.float32)
+    # how far into the mid region each step sits, in ramp units: <= 0 at
+    # and outside the endpoints, saturating to 1 deep in the transit
+    into_mid = torch.minimum(t - (grab * k + hold),
+                             (release * k - hold) - t) / ramp
+    return end + (mid - end) * into_mid.clamp(0.0, 1.0)
 
 
 def _env_params(config) -> list[list[dict]]:
     """Per-iteration domain-randomization parameter sets.
 
-    num_dr == 1 means the margin/offset endpoints are applied but not
-    varied.
+    num_dr == 1 means the nominal midpoint, not the ranges' low endpoint
+    that np.linspace(n=1) would return.
     """
     assert config.num_dr >= 1, "num_dr must be >= 1 or nothing gets rolled out"
-    xy = np.linspace(*config.xy_offset_range, config.num_dr)
-    margin = np.linspace(*config.pair_margin_range, config.num_dr)
+
+    def spread(lo_hi):
+        if config.num_dr == 1:
+            return np.array([float(np.mean(lo_hi))])
+        return np.linspace(*lo_hi, config.num_dr)
+
+    xy = spread(config.xy_offset_range)
+    margin = spread(config.pair_margin_range)
     per_iter = [{"xy_offset": xy[j], "pair_margin": margin[j]}
                 for j in range(config.num_dr)]
     return [list(per_iter) for _ in range(config.max_num_iterations)]
@@ -100,8 +122,8 @@ def solve(config) -> dict:
 
     env = setup_env(config, ref_data)
 
-    # a CPU MuJoCo model alongside the warp worlds: it owns the clock that
-    # drives the receding horizon, and it is where qpos is read back to
+    # a CPU MuJoCo model alongside the warp worlds: it owns the receding
+    # horizon's clock and is where qpos is read back to
     mj_model = setup_mj_model(config)
     mj_data = mujoco.MjData(mj_model)
     mj_data.qpos[:] = qpos_ref[0].detach().cpu().numpy()
@@ -110,23 +132,72 @@ def solve(config) -> dict:
     mujoco.mj_step(mj_model, mj_data)
     mj_data.time = 0.0
 
-    config.trace_site_ids = _trace_site_ids(mj_model)
     config.env_params_list = _env_params(config)
 
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
     (Path(config.output_dir) / CONFIG_JSON).write_text(
         json.dumps(spider_cfg.summarize(config), indent=2, default=str) + "\n")
 
-    # palms target the SIMULATED box's grasp faces (half extents read off
-    # the model), not the baked reference contact points
+    # box_half turns on the face contact term: palms target the SIMULATED
+    # box's grasp faces. box_carry only — ground_pick reuses the largebox
+    # names for a one-hand object, where both palms on side faces is wrong.
+    info_path = Path(config.model_path).parent / "task_info.json"
+    task_info = (json.loads(info_path.read_text())
+                 if info_path.exists() else {})
+    task_type = task_info.get("task_type", "box_carry")
     box_gid = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM,
                                 "largebox_geom")
-    box_half = mj_model.geom_size[box_gid].copy() if box_gid >= 0 else None
-    reward_fn, terminal_reward_fn = make_reward_fns(config, box_half=box_half)
+    box_half = (mj_model.geom_size[box_gid].copy()
+                if box_gid >= 0 and task_type == "box_carry" else None)
 
+    # damp finger-actuator exploration when the trial asks: sampled
+    # wiggling pries a held object out of the grasp
+    hand_scale = task_info.get("hand_noise_scale")
+    if hand_scale is not None:
+        hand_kw = ("thumb", "index", "middle", "ring", "pinky")
+        hand_ids = [
+            a for a in range(mj_model.nu)
+            if any(k in (mujoco.mj_id2name(
+                mj_model, mujoco.mjtObj.mjOBJ_ACTUATOR, a) or "")
+                for k in hand_kw)]
+        if hand_ids:
+            config.noise_scale[:, :, hand_ids] *= float(hand_scale)
+
+    # grip reward targets: ground_pick anchors the object center in the
+    # one picking palm, pole anchors each hand's grab height up the axis
+    grips = None
+    pocket = task_info.get("grasp_pocket")
+    if task_type == "ground_pick" and pocket is not None:
+        grips = [(pocket, 0 if task_info.get("pick_hand") == "left" else 1,
+                  None)]
+    elif task_type == "pole_carry":
+        grips = [(g["pocket"], 0 if g["hand"] == "left" else 1,
+                  g.get("anchor"))
+                 for g in task_info.get("grips") or []
+                 if g.get("pocket") is not None] or None
+
+    # the template's ghost self-collision pairs (forceless, solver-free)
+    # feed the self-penetration penalty
+    self_pairs = [
+        (int(mj_model.pair_geom1[p]), int(mj_model.pair_geom2[p]))
+        for p in range(mj_model.npair)
+        if (mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_PAIR, p) or ""
+            ).startswith("self_")]
+
+    reward_fn, terminal_reward_fn = make_reward_fns(
+        config, box_half=box_half, grips=grips, self_pairs=self_pairs)
+
+    # the per-step object weight rides along as a 6th reference channel;
+    # setup_env above already took the 5-tuple SPIDER expects
+    ref_data = (*ref_data,
+                _obj_weight_profile(config, task_info, qpos_ref.shape[0]))
+
+    skip_zero_perturbation(config)
     rollout = make_rollout_fn(
         step_env, save_state, load_state, reward_fn, terminal_reward_fn,
-        get_terminate, get_trace, save_env_params, load_env_params,
+        # spider's terminate check unpacks exactly five ref tensors
+        lambda c, e, r: get_terminate(c, e, r[:5]),
+        save_env_params, load_env_params,
         copy_sample_state,
     )
     optimize = make_optimize_fn(make_optimize_once_fn(rollout))

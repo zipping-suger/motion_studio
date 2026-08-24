@@ -1,12 +1,12 @@
 """Scene reconstruction: a robot-only Kimodo clip -> a physics trial.
 
-This is the science studio owns: grasp detection, interaction graph,
-hindsight scene reconstruction, trial emission (SceneBot-derived, arXiv
-2606.27581) — plus forcing the contact window and re-deriving everything
-measured from it, so a misdetected window can be corrected from the GUIs.
+Grasp detection, interaction graph, hindsight scene reconstruction and
+trial emission (SceneBot-derived, arXiv 2606.27581), plus forcing the
+contact window and re-deriving everything measured from it, so a
+misdetected window can be corrected from the GUIs.
 
-Needs numpy + mujoco and the G1 assets (see `assets.py`); no solver and
-no GPU, so it runs in studio's own venv.
+Needs numpy + mujoco and the G1 assets; no solver and no GPU, so it runs
+in studio's own venv.
 
     qpos, meta, grasp = recon.detect(npz)
     task_dir, grasp, line = recon.reconstruct(npz, out_root, task)
@@ -49,10 +49,10 @@ def reconstruct(
 ) -> Tuple[Optional[Path], GraspInfo, str]:
     """Full reconstruction of one clip.
 
-    pick/release force the contact window; either alone keeps the
-    detected value for the other. Returns (task_dir or None, grasp,
-    one-line summary) — None means the motion is inconsistent with any
-    scene, which is a verdict rather than an error.
+    pick/release force the contact window; either alone keeps the detected
+    value for the other. Returns (task_dir or None, grasp, one-line
+    summary). None means the motion admits no scene, a verdict rather
+    than an error.
     """
     params = {**SCENE_DEFAULTS, **(scene_params or {})}
     qpos, meta, grasp = detect(npz_path, allow_held_start)
