@@ -5,8 +5,9 @@ Generate a single G1 motion clip with [Kimodo](https://github.com/nv-tlabs/kimod
 
 <!-- regenerate: MUJOCO_GL=egl .venv-solve/bin/python scripts/render_docs_gifs.py -->
 
-**Generate** — Kimodo turns a text prompt into a motion clip (the checked-in
-`samples/box_carrying.npz`):
+**Generate** — Kimodo turns a text prompt into a motion clip (here
+`box/box_carrying.npz` from the shared [raw_motion
+folder](https://drive.google.com/drive/folders/1wmYjD67HLxyS4uRMiLRxnktQ4qyoOHlx)):
 
 ![Kimodo motion generation](docs/generate.gif)
 
@@ -91,12 +92,15 @@ uv run studio panel     # :8082 — pick a clip from raw_motion/ (previews on
                         # and watch reference vs solution side by side
 ```
 
-Or scripted, no GUI — works on the checked-in sample clip with no demo and no
-cluster:
+Or scripted, no GUI — works on a shared sample clip with no demo and no
+cluster. The clips live in a [Google Drive
+folder](https://drive.google.com/drive/folders/1wmYjD67HLxyS4uRMiLRxnktQ4qyoOHlx)
+(`raw_motion/` is gitignored): download it into `raw_motion/`, keeping its
+layout (`box/`, `ground_pick/<clip>/`, `pole/`, `ommo/`, `behave/chairwood/`),
+or just the one clip below.
 
 ```bash
-cp samples/box_carrying.npz raw_motion/
-uv run studio recon raw_motion/box_carrying.npz --name demo
+uv run studio recon raw_motion/box/box_carrying.npz --name demo
 uv run studio solve demo         # --num-samples 1024 if VRAM is tight
 uv run studio list               # runs + LIFT / DR verdicts
 ```
