@@ -14,8 +14,9 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import manifest, shim, solve, tasks
+from . import manifest, runner, shim, tasks
 from .config import REPO_ROOT, RUNS_DIR, Config, task_dirs
+from .solve import evaluate
 
 # lines worth echoing from the (very chatty) solve log
 _SOLVE_ECHO = re.compile(r"Final |Traceback|Error|error", re.IGNORECASE)
@@ -81,8 +82,8 @@ def reconstruct(cfg: Config, run_dir: Path, motion_dir: Path,
     The recon side of every task is numpy + mujoco, so it runs in-process —
     no venv hop, no GPU. `options` are forwarded to the task's reconstruct
     (for box_carry: scene_params, allow_held_start, pick, release; for
-    under_table: scene_params incl. scene_seed). Returns task dirs ([] on
-    failure/skip; the verdict lands in the manifest)."""
+    the others: scene_params). Returns task dirs ([] on failure/skip; the
+    verdict lands in the manifest)."""
     name = run_dir.name
     task_obj = tasks.load(_task_type(run_dir))
     logs = run_dir / "logs"
@@ -119,20 +120,24 @@ def reconstruct(cfg: Config, run_dir: Path, motion_dir: Path,
 def solve_tasks(cfg: Config, run_dir: Path, task_list: list[Path],
                 params: dict | None = None) -> bool:
     """Solve every built trial of a run, then record the verdict. Returns
-    True iff a trial passes the task's success criterion (box_carry: LIFT;
-    under_table: collision-free + task preserved)."""
+    True iff a trial passes the task's success criterion (Task.passed).
+    `params` are the explicitly set solve params; the task resolves the
+    rest."""
     task_obj = tasks.load(_task_type(run_dir))
-    solve.require(cfg)
+    runner.require(cfg)
     logs = run_dir / "logs"
     logs.mkdir(exist_ok=True)
+    # the subprocess reads no config: it gets the task's defaults,
+    # config.yml's tasks.<name>.solve and the explicit params, resolved
+    resolved = task_obj.solve_params(params)
 
     for task_dir in task_list:
         task = task_dir.name
         log_path = logs / f"solve_{task}.log"
         print(f"=== {task_obj.name} solve: {task} ===")
         rc = _stream(
-            task_obj.solve_command(cfg, task, run_dir / "outputs", params),
-            cwd=REPO_ROOT, log_path=log_path, env=solve.env(), sparse=True,
+            runner.command(cfg, task, run_dir / "outputs", resolved),
+            cwd=REPO_ROOT, log_path=log_path, env=runner.env(), sparse=True,
         )
         if rc != 0:
             print(f"solve failed (see {log_path})")
@@ -140,13 +145,13 @@ def solve_tasks(cfg: Config, run_dir: Path, task_list: list[Path],
             return False
 
     print("=== evaluation ===")
-    rows = task_obj.evaluate(task_list)
-    print(task_obj.format_table(rows))
-    verdict = task_obj.verdict(rows)
+    rows = evaluate.evaluate_tasks(task_list)
+    print(evaluate.format_table(rows))
+    verdict = evaluate.verdict(rows)
     manifest.update(run_dir, {
         "verdict": verdict,
         "solve_params": params or {},
-        "eval_rows": [task_obj.format_row(n, r) for n, r in rows],
+        "eval_rows": [evaluate.format_row(n, r) for n, r in rows],
     })
     print(f"verdict: {verdict}   (view with: studio view {run_dir.name})")
     return task_obj.passed(verdict)

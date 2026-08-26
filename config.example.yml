@@ -54,28 +54,17 @@
 # solve:
 #   num_samples: 1024      # parallel worlds; lower this if the GPU OOMs
 #   max_num_iterations: 16 # annealing iterations per control tick
+#   knot_dt: 0.1           # s, spline knot spacing; snapped to a whole
+#                          # number of sim steps that tiles the horizon
 #   pos_rew_scale: 8.0     # object position — the objective
 #   joint_rew_scale: 0.5   # robot pose — a guide only
 
 # Per-task defaults overrides for the other downstream tasks (the scene:/
-# solve: sections above are the box_carry task's). Keys per task live in
-# src/studio/tasks/<task>_params.py; `--set key=value` overrides per run.
+# solve: sections above are the box_carry task's). Scene keys per task are
+# SCENE_DEFAULTS in src/studio/tasks/<task>.py, solve keys the shared
+# SOLVE_DEFAULTS (src/studio/solve/defaults.py); `--set key=value`
+# overrides per run.
 # tasks:
-#   under_table:
-#     scene:
-#       yaw_range: 0.21        # table yaw sampled in +/- this (rad); 0 = off
-#       underside_drop: 0.04   # height difficulty knob
-#       max_ref_table_pen: 0.06  # closeness difficulty knob
-#     solve:
-#       num_samples: 1024      # parallel worlds; lower this if the GPU OOMs
-#     verify:
-#       max_pick_err: 0.15     # task preservation: pick hand vs reference
-#   kick:
-#     scene:
-#       max_ref_pen: 0.05      # closeness: reference foot sinks this deep
-#       box_width: 0.40
-#     verify:
-#       max_kick_err: 0.15     # task preservation: foot vs reference kick point
 #   pole:
 #     scene:
 #       object: auto           # a measured mesh under assets/object_mesh/
@@ -88,6 +77,25 @@
 #       right: auto            # S-E / S- inclusive frames
 #     solve:
 #       num_samples: 1024      # parallel worlds; lower this if the GPU OOMs
+#   chair:                     # BEHAVE clips (raw_motion/behave), which
+#     scene:                   # carry the chair's own pose per frame
+#       object: auto           # a chair sidecar (chairwood | ...) or auto
+#                              # (the clip's object_name); contact windows,
+#                              # the sit and the chair's motion are detected
+#       mass: 0.0              # kg; 0 = the object spec's default
+#       grasp: auto            # ik_retargeted (arm re-posed onto a grasp
+#                              # that fits the chair) | reference | auto
+#       left: auto             # per-hand GRIP window: auto | off |
+#       right: auto            # S-E / S- inclusive frames
+#     solve:
+#       grasp_rew_scale: 0.5   # reward per hand for palm/finger geoms
+#                              # touching the chair (0 disables)
+#       grasp_pen_rew_scale: 50  # penalty per metre of hand-chair
+#                              # penetration beyond 5 mm (no caging)
+#       support_rew_scale: 0.5 # keep the body supports (hip, torso,
+#                              # forearms) the reference carries on
+#       grip_rew_scale: 4.0    # hold the chair's anchors in the pockets
+#       rot_rew_scale: 1.0     # a chair's orientation is the carry
 
 # demo:
 #   model: Kimodo-G1-RP-v1

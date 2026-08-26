@@ -105,50 +105,70 @@ uv run studio list               # runs + LIFT / DR verdicts
 
 ## Downstream tasks
 
-Recon and solve are pluggable per **task** (`src/studio/tasks/`); every run
-records its task and `studio solve` / `studio list` follow it. `box_carry`
-(everything above) is the default. The second task is collision-free
-augmentation:
+Every task is a human-object interaction reconstructed from a robot-only
+clip and solved by the same solver; what differs between tasks is data.
+A task is two files: its glue in `src/studio/tasks/<task>.py` (scene
+params, dropdown choices, solve-weight deltas, pass criterion — MuJoCo-free,
+so both GUIs build their controls from it) and its reconstruction in
+`src/studio/recon/<task>.py`, a `ReconTask` with two hooks that the shared
+pipeline (`recon/run.py`) drives:
 
-**`under_table`** — an under-table-pick clip implies a table; place a
-randomized one (slab + 4 legs, seeded jitter + yaw) over the ducking robot
-from head-trajectory FK, then re-solve with receding-horizon MPPI so the
-robot tracks the reference while actually avoiding the now-solid table
-(tracking + stability + analytic-SDF avoidance rewards). Verification:
-SDF penetration, pelvis drift, and the pick-hand task-preservation check.
+- **`detect(qpos, meta, params, options)`** — when, and with which hands,
+  the robot touches the object;
+- **`build(qpos, meta, interaction, params)`** — what the object is, where
+  it goes, how the hands hold it, and the MuJoCo scene, composed from the
+  shared kernels (`recon/mjcf.py` template surgery, `pick.calibrate_grasp`
+  / `wrist_ik_frame`, `pole._conform_fingers`, `recon/objects.py` mesh
+  roster).
+
+The pipeline then does what every task needs: the frame-0 spawn check, the
+per-palm contact reference, SceneBot's interaction-graph labels, and writes
+the trial (`recon/spec.py`). The trial's `task_info.json` is the contract
+the solver reads (`solve/spec.py`): `object.faces` (a box whose palm faces
+are the contact targets), `object.symmetry`, `grips[]` (each holding hand's
+palm pocket + object anchor), `supports[]`. The solver never sees a task
+name. Every run records its task and `studio solve` / `studio list` follow
+it; `box_carry` (everything above) is the default.
+
+**`pole`** / **`chair`** — real-mesh object interaction. `pole` infers a
+floor lamp / tripod / clothes stand from the hands of an object-free clip
+(the hold reads as a hand pair stacked along the pole). `chair` takes a
+BEHAVE clip (`raw_motion/behave/`, exported with the chair's own pose per
+frame) and detects contact the way SceneBot defines it, against the actual
+mesh: a hand holds the chair while its palm sits at the hull surface and
+moves with the chair, and only if the chair moves meanwhile — an arm hanging
+beside the backrest is not a grip; a pelvis parked over a chair that stays
+put is a sit. Inside a hold, the *grip* is the stretch where the hand moves
+rigidly with the chair (the BEHAVE hands slide 20-50 cm from first touch to
+the carry). The chair is spawned from that contact: standing where the first
+hand meets it (nudged out of the robot's approach), following the clip's
+trajectory while held, pushed out of any body geom it passes through, parked
+after the release — the chair scene restores the template's body collision
+geoms (torso, pelvis, hips, shins, head, arms), so the solve can never pass
+it through the body. Each grip gets an anchor on the member's centre line,
+a grasp *fit* search (the closed hand slid along the member and turned
+about it until it clears the neighbouring members), a 7-joint arm IK onto
+that pose, and finger closure conformed onto the hulls. Carries are
+multi-contact: each hand either *wraps* a member the closed hand can
+enclose (legs, rails) or *presses* its open palm against a face it cannot
+(seat underside, slats), and body geoms the chair rests on (torso, hip,
+thighs, forearms) are detected as *supports*. The anchors feed the solve's
+grip reward; `grasp_rew_scale` rewards hand geoms touching the object,
+`grasp_pen_rew_scale` prices their penetration depth (no carrying a rail
+buried in the palm box), and `support_rew_scale` keeps the body supports
+the reference carries on.
 
 ```bash
-uv run studio recon <under_table_pick clip>.npz --task under_table \
-    --name ut0 --scene-seed 3          # placement is seeded: new seed, new scene
-uv run studio solve ut0                # --set num_samples=1024 if VRAM is tight
-uv run studio list                     # PASS = collision-free + task preserved
+uv run studio recon raw_motion/behave/chairwood/D01S01_chairwood_lift_c1_kin.npz \
+    --task chair --name chair0        # --set left=off for a one-hand carry
+uv run studio solve chair0            # LIFT / DR verdicts as for box_carry
 ```
 
-Or in the panel: `uv run studio panel`, task `under_table`, pick a clip from
-`raw_motion/` → **1. Estimate table** (change the seed / difficulty knobs and
-re-estimate; the table redraws) → **2. Solve MPPI** → reference (transparent)
-vs augmented (solid) playback. `studio view <run>` opens an existing run in
-the right mode.
-
-**`kick`** — a Kimodo-generated kick clip; place a randomized
-floor-standing box in the kicking foot's approach path (seeded position
-along the path, lateral/yaw jitter) so the reference swing penetrates it,
-then re-solve. Placement guarantees the kick point itself stays outside
-the box and the rest of the body clears it — only the kicking leg
-conflicts, and re-pathing it is the solver's work. Verification adds the
-kick-preservation check (kicking foot vs the reference kick point).
-
-```bash
-uv run studio recon <kick clip>.npz --task kick --name k0 --scene-seed 2
-uv run studio solve k0
-```
-
-Task knobs (difficulty, reward weights, verify thresholds) live in
-`src/studio/tasks/<task>_params.py`; override per machine via config.yml's
-`tasks:` section or per run via `--set key=value`. The under-table
-estimation and both tasks' rewards port the `mppi_obstacle` experiment's
-certified defaults (see that repo's README for the difficulty sweeps);
-the kick solve weights are starting points, not yet swept.
+Task knobs (scene params, solve-weight deltas) live in
+`src/studio/tasks/<task>.py` (`SCENE_DEFAULTS`, `SOLVE_OVERRIDES`); override
+per machine via config.yml's `tasks:` section or per run via
+`--set key=value`. The solve subprocess is handed the fully resolved params
+(`Task.solve_params`) and reads no config of its own.
 
 ## References
 

@@ -1,19 +1,20 @@
 """Build SPIDER's Config directly — no hydra.
 
 FIXED is the whole fixed task setup as one dict; the hyperparameters
-worth tuning live in `config.SOLVE_DEFAULTS` and layer on top per run.
-Values are validated literals — `sim_dt` is 0.0166667 rather than 1/60
-because it becomes the MuJoCo timestep, so the rounding reproduces.
+worth tuning live in `defaults.SOLVE_DEFAULTS` and layer on top per run,
+already resolved by the launcher (a task's own values arrive as explicit
+params, never by task name). Values are validated literals — `sim_dt` is
+0.0166667 rather than 1/60 because it becomes the MuJoCo timestep, so
+the rounding reproduces.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from spider.config import Config, process_config
 
-from ..config import POLE_SOLVE_OVERRIDES, SOLVE_DEFAULTS, SOLVE_INT_KEYS
+from .defaults import SOLVE_DEFAULTS, SOLVE_INT_KEYS
 
 FIXED = {
     # --- task -----------------------------------------------------------
@@ -29,7 +30,6 @@ FIXED = {
     "ctrl_dt": 0.1,           # one control tick = 6 sim steps
     "ref_dt": 0.0333333,      # 1/30; task_info.json overrides this anyway
     "render_dt": 0.02,
-    "knot_dt": 0.1,           # 10 spline knots over a 1.0 s horizon
     "max_sim_steps": -1,      # -1: derive from the reference length
     "nconmax_per_env": 120,
     "njmax_per_env": 350,
@@ -75,6 +75,24 @@ FIXED = {
 }
 
 
+def snap_knot_dt(knot_dt: float, horizon: float, sim_dt: float) -> float:
+    """The nearest legal knot spacing to `knot_dt`.
+
+    Knots must land on sim steps AND tile the horizon exactly: SPIDER
+    upsamples its (num_samples, num_knots, nu) noise by knot_steps and
+    adds the result to a horizon_steps-long control buffer, so
+    knot_steps has to divide horizon_steps. A GUI value that misses (any
+    knot_dt that is not horizon / an integer) snaps to the nearest one
+    that lands, ties going to the finer spacing.
+    """
+    horizon_steps = int(round(horizon / sim_dt))
+    want = max(1, int(round(knot_dt / sim_dt)))
+    steps = min((d for d in range(1, horizon_steps + 1)
+                 if horizon_steps % d == 0),
+                key=lambda d: (abs(d - want), d))
+    return steps * sim_dt
+
+
 def coerce(params: dict | None) -> dict:
     """Cast GUI/CLI values to the types the optimizer needs."""
     out = {}
@@ -88,21 +106,9 @@ def coerce(params: dict | None) -> dict:
 
 # solve params of studio's own reward terms — SPIDER's Config dataclass
 # rejects unknown kwargs, so these ride as attributes set after build
-STUDIO_KEYS = ("grip_rew_scale", "self_collision_rew_scale",
-               "upright_rew_scale", "obj_end_rew_scale",
-               "obj_mid_rew_scale")
-
-
-def _task_defaults(task: str, dataset_dir: Path) -> dict:
-    """Per-task-type solve defaults from the trial's own task_info: they
-    beat SOLVE_DEFAULTS but lose to explicit params."""
-    info_path = (Path(dataset_dir) / "processed" / "kimodo" / "unitree_g1"
-                 / "humanoid_object" / task / "task_info.json")
-    try:
-        task_type = json.loads(info_path.read_text()).get("task_type", "")
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return POLE_SOLVE_OVERRIDES if task_type.startswith("pole") else {}
+STUDIO_KEYS = ("grip_rew_scale", "grasp_rew_scale", "grasp_pen_rew_scale",
+               "support_rew_scale", "self_collision_rew_scale",
+               "upright_rew_scale", "obj_end_rew_scale", "obj_mid_rew_scale")
 
 
 def build(task: str, dataset_dir: Path, params: dict | None = None) -> Config:
@@ -110,11 +116,20 @@ def build(task: str, dataset_dir: Path, params: dict | None = None) -> Config:
     values = {
         **FIXED,
         **SOLVE_DEFAULTS,
-        **_task_defaults(task, dataset_dir),
         **coerce(params),
         "task": task,
         "dataset_dir": str(dataset_dir),
     }
+    snapped = snap_knot_dt(values["knot_dt"], values["horizon"],
+                           values["sim_dt"])
+    # half a sim step of slack: sim_dt is a rounded literal, so an
+    # already-legal knot_dt comes back a few 1e-7 off
+    if abs(snapped - values["knot_dt"]) > values["sim_dt"] / 2:
+        print(f"knot_dt {values['knot_dt']:g} does not tile the "
+              f"{values['horizon']:g} s horizon in whole sim steps — "
+              f"using {snapped:g}")
+    values["knot_dt"] = snapped
+
     extra = {k: values.pop(k) for k in STUDIO_KEYS if k in values}
     config = process_config(Config(**values))
     for key, val in extra.items():

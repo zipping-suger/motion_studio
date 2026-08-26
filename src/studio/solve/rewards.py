@@ -23,6 +23,18 @@ from .quat import quat_sub
 
 # per qvel block; humanoid_object nv layout is [0:3] base lin, [3:6] base
 # ang, [6:-6] joints, [-6:-3] object lin, [-3:] object ang
+# the grasp term: a hand geom counts as touching the object within this
+# (soft contacts sit a few mm deep), and a hand with this many touching
+# geoms (palm + a finger's worth of capsules) has grasped fully
+GRASP_TOUCH = 0.002        # m
+GRASP_CONTACT_CAP = 6.0
+GRASP_PEN_TOL = 0.005      # m: hand-object penetration priced from here
+                           # (soft contacts sit a few mm deep when
+                           # pressing; deeper is the hand digging in)
+# the support term: a body geom the reference rests the object on has
+# supported it once this many contact points bear on it
+SUPPORT_CONTACT_CAP = 2.0
+
 VEL_WEIGHTS = {
     "base_lin": 0.06,
     "base_ang": 0.02,
@@ -156,7 +168,7 @@ def make_box_face_contact_fns(
 
 
 def make_reward_fns(config: Config, box_half=None, grips=None,
-                    self_pairs=None):
+                    self_pairs=None, grasp=None, support=None):
     """The whole reward stack fused into one torch.compile'd core.
 
     Wrapper-per-term composition launched ~50 tiny kernels per rollout
@@ -178,6 +190,22 @@ def make_reward_fns(config: Config, box_half=None, grips=None,
       own posture, so a fall costs more than a pose error.
     - self_pairs: summed penetration depth over the template's ghost
       self-collision pairs, which exert no force.
+    - grasp: (geom -> palm column, object-geom mask) — rewards each
+      holding hand for the number of its geoms (palm box + finger
+      capsules) actually touching the object, saturating at
+      GRASP_CONTACT_CAP, gated by the reference contact mask, and
+      (grasp_pen_rew_scale) penalises their penetration depth beyond
+      GRASP_PEN_TOL, summed, ungated. The grip term above holds the
+      object in the pocket; the contact count asks the fingers to close
+      on it, which sampling alone finds late; the depth penalty keeps
+      the palm from burying a member inside its box, where the box
+      cages it and the object gets carried by penetration force.
+    - support: (geom -> support group, number of groups) — rewards each
+      body-support group (torso, hip, thigh, forearm... whatever the
+      reference rests the object on) for its contacts with the object,
+      saturating at SUPPORT_CONTACT_CAP, gated per group by ref[6],
+      loop.py's per-step support windows. Multi-contact carries are
+      held by these as much as by the hands.
 
     Info dicts are empty; nothing in studio reads them."""
     device = config.device
@@ -237,6 +265,15 @@ def make_reward_fns(config: Config, box_half=None, grips=None,
             sorted((min(a, b) << 16) + max(a, b) for a, b in self_pairs),
             dtype=torch.int64, device=device)
 
+    grasp_scale = float(getattr(config, "grasp_rew_scale", 0.0))
+    grasp_pen_scale = float(getattr(config, "grasp_pen_rew_scale", 0.0))
+    use_grasp = ((grasp_scale != 0.0 or grasp_pen_scale != 0.0)
+                 and grasp is not None and bool(grasp[1].any()))
+    if use_grasp:
+        geom_hand = torch.tensor(grasp[0], dtype=torch.long, device=device)
+        geom_obj = torch.tensor(grasp[1], dtype=torch.bool, device=device)
+        n_hand_cols = int(geom_hand.max().item()) + 1
+
     upright_scale = float(getattr(config, "upright_rew_scale", 0.0))
     use_upright = upright_scale != 0.0
     objw_one = torch.ones((), device=device)
@@ -244,12 +281,23 @@ def make_reward_fns(config: Config, box_half=None, grips=None,
     need_xmat = use_grips
     need_rot = use_face or (use_grips and grips_anchored)
     need_sites = use_face or use_baked or use_grips
+    support_scale = float(getattr(config, "support_rew_scale", 0.0))
+    use_support = (support_scale != 0.0 and support is not None
+                   and int(support[1]) > 0)
+    if use_support:
+        geom_supp = torch.tensor(support[0], dtype=torch.long, device=device)
+        n_supp = int(support[1])
+        if not use_grasp:
+            geom_obj = torch.tensor(grasp[1], dtype=torch.bool, device=device)
+    supp_none = torch.zeros(1, device=device)
+
+    need_contacts = use_self or use_grasp or use_support
     num_samples = int(config.num_samples)
     terminal_scale = float(config.terminal_rew_scale)
 
     # --- the fused core: pure tensor ops, one call per sim step ---------
     def core(qpos, qvel, site_xpos, site_xmat, cgeom, cdist, cdim, cwid,
-             ref_qpos, ref_qvel, ref_contact, ref_cpos, ref_objw):
+             ref_qpos, ref_qvel, ref_contact, ref_cpos, ref_objw, ref_supp):
         # mjwp._diff_qpos's humanoid_object branch inlined with the
         # sync-free quat_sub (spider's branches per call, see .quat);
         # ref_objw shapes the OBJECT entries over time — full weight at
@@ -320,6 +368,51 @@ def make_reward_fns(config: Config, box_half=None, grips=None,
                                            torch.zeros_like(cdist)))
             rew = rew - self_scale * depth
 
+        if use_grasp:
+            # a contact is a grasp contact when one geom is a hand geom
+            # and the other the object; count them per world and hand
+            a, b = cgeom[:, 0], cgeom[:, 1]
+            col = torch.where(geom_obj[b], geom_hand[a],
+                              torch.where(geom_obj[a], geom_hand[b],
+                                          torch.full_like(a, -1)))
+            live = ((cdim > 0) & (col >= 0) & (cwid >= 0)
+                    & (cwid < num_samples))
+            wid = cwid.clamp(0, num_samples - 1)
+            if grasp_scale != 0.0:
+                valid = live & (cdist < GRASP_TOUCH)
+                idx = wid * n_hand_cols + col.clamp(0, n_hand_cols - 1)
+                counts = torch.zeros(num_samples * n_hand_cols,
+                                     device=cdist.device)
+                counts.scatter_add_(0, idx, valid.to(counts.dtype))
+                counts = counts.view(num_samples, n_hand_cols)
+                held = counts.clamp(max=GRASP_CONTACT_CAP) / GRASP_CONTACT_CAP
+                gate = ref_contact[:n_hand_cols].unsqueeze(0)
+                rew = rew + grasp_scale * (held * gate).sum(dim=1)
+            if grasp_pen_scale != 0.0:
+                deep = torch.where(live, (-cdist - GRASP_PEN_TOL).clamp(min=0.0),
+                                   torch.zeros_like(cdist))
+                depth = torch.zeros(num_samples, device=cdist.device)
+                depth.scatter_add_(0, wid, deep)
+                rew = rew - grasp_pen_scale * depth
+
+        if use_support:
+            # a support contact: one geom in a support group, the other
+            # the object; count them per world and group
+            a, b = cgeom[:, 0], cgeom[:, 1]
+            grp = torch.where(geom_obj[b], geom_supp[a],
+                              torch.where(geom_obj[a], geom_supp[b],
+                                          torch.full_like(a, -1)))
+            valid = ((cdim > 0) & (cdist < GRASP_TOUCH) & (grp >= 0)
+                     & (cwid >= 0) & (cwid < num_samples))
+            idx = cwid.clamp(0, num_samples - 1) * n_supp \
+                + grp.clamp(0, n_supp - 1)
+            counts = torch.zeros(num_samples * n_supp, device=cdist.device)
+            counts.scatter_add_(0, idx, valid.to(counts.dtype))
+            counts = counts.view(num_samples, n_supp)
+            borne = counts.clamp(max=SUPPORT_CONTACT_CAP) / SUPPORT_CONTACT_CAP
+            rew = rew + support_scale * (borne * ref_supp[:n_supp]
+                                         .unsqueeze(0)).sum(dim=1)
+
         return rew
 
     if getattr(config, "use_torch_compile", False):
@@ -333,7 +426,7 @@ def make_reward_fns(config: Config, box_half=None, grips=None,
             site_xmat = wp.to_torch(data.site_xmat)
             site_xmat = site_xmat.reshape(site_xmat.shape[0], -1, 3, 3)
         cgeom = cdist = cdim = cwid = None
-        if use_self:
+        if need_contacts:
             cgeom = wp.to_torch(data.contact.geom).long()
             cdist = wp.to_torch(data.contact.dist)
             cdim = wp.to_torch(data.contact.dim)
@@ -341,7 +434,8 @@ def make_reward_fns(config: Config, box_half=None, grips=None,
         return (wp.to_torch(data.qpos), wp.to_torch(data.qvel),
                 site_xpos, site_xmat, cgeom, cdist, cdim, cwid,
                 ref[0], ref[1], ref[3], ref[4],
-                ref[5] if len(ref) > 5 else objw_one)
+                ref[5] if len(ref) > 5 else objw_one,
+                ref[6] if len(ref) > 6 else supp_none)
 
     def get_reward(config, env, ref):
         return core(*gather(env, ref)), {}

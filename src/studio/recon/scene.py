@@ -9,34 +9,24 @@ From a robot-only kinematic motion + its scene-interaction graph:
     (Alg. 1 line 27) rather than skipping the clip,
   - the box reference trajectory,
   - per-link contact labels for all key links x {terrain, object},
-emitted as a trial under
-  {out_root}/processed/kimodo/unitree_g1/humanoid_object/{task}/
+which `box_carry.BoxCarryTask` composes into a trial through the shared
+pipeline (recon.run / recon.spec).
 """
 
-import json
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import mujoco
 import numpy as np
 
-from ..config import SCENE_DEFAULTS
-from . import assets, layout
+from . import assets, mjcf
 from .grasp import GraspInfo
-from .graph import (
-    KEY_LINKS,
-    SCENE_TYPES,
-    InteractionGraph,
-    build_interaction_graph,
-)
-from .loader import KIM_LEFT_HAND_TIP, KIM_RIGHT_HAND_TIP, compute_qvel
+from .graph import InteractionGraph
+from .loader import KIM_LEFT_HAND_TIP, KIM_RIGHT_HAND_TIP
 from .signal import smooth
 
-__all__ = ["SCENE_DEFAULTS", "BoxSpec", "Plateau", "SceneSpec", "emit_trial",
-           "build_object_trajectory", "generate_scene_xml",
-           "reconstruct_terrain", "measure_spawn_penetration"]
+__all__ = ["BoxSpec", "Plateau", "SceneSpec", "build_object_trajectory",
+           "generate_scene_xml", "reconstruct_terrain"]
 
 # --- box placement optimization ---------------------------------------------
 # The rest pose is read off noisy hands at one frame, so the box and its slab
@@ -79,14 +69,6 @@ EXEMPT_KPS = {
     "right_foot": (12, 13, 14),
     "pelvis": (0, 1, 2, 3, 4, 8, 9, 10, 11),   # pelvis + hip/thigh/knee chain
 }
-
-ROBOT_CONTACT_GEOMS = ("lh", "rh", "lf0", "lf1", "lf2", "lf3",
-                       "rf0", "rf1", "rf2", "rf3")
-SPAWN_PEN_TOL = 0.004   # m: report robot-vs-scene penetrations deeper than this
-SPAWN_SKIP_PEN = 0.03   # m: frame-0 penetration beyond this -> skip the clip
-                        # (placement search maxed out; settle would explode)
-# hand/wrist geoms whose frame-0 box contact is expected for held starts
-HAND_SPAWN_GEOMS = ("lh", "rh", "left_wrist_collision", "right_wrist_collision")
 
 
 @dataclass
@@ -359,11 +341,11 @@ def generate_scene_xml(spec: SceneSpec, hand_geom: str = "capsule") -> str:
         size="{b.half_w:.4f} {b.half_d:.4f} {b.half_h:.4f}"
         class="visual" material="black" />
     </body>'''
-    xml, n = re.subn(r'<body name="largebox".*?</body>', box_body, xml, flags=re.S)
-    assert n == 1, "largebox body not found in template"
+    xml = mjcf.replace_object_body(xml, box_body)
 
     # the template ships body collision geoms commented out (menagerie-MJX
-    # lineage); enable the ones the box can plausibly hit and pair them
+    # lineage); enable them and pair the ones the box can plausibly hit
+    xml = mjcf.restore_body_collision(xml)
     body_geoms = [
         "pelvis_collision",
         "left_hip_collision", "right_hip_collision",
@@ -378,31 +360,16 @@ def generate_scene_xml(spec: SceneSpec, hand_geom: str = "capsule") -> str:
         "left_elbow_yaw_collision", "right_elbow_yaw_collision",
         "left_wrist_collision", "right_wrist_collision",
     ]
-    for lead in ("pelvis_collision", "left_hip_collision",
-                 "right_hip_collision", "left_thigh_collision",
-                 "right_thigh_collision", "left_shin_collision",
-                 "right_shin_collision", "torso_collision", *arm_geoms):
-        xml, n = re.subn(
-            rf'<!--\s*(<geom name="{lead}".*?)\s*-->', r"\1", xml, flags=re.S
-        )
-        # thigh/wrist ship ACTIVE (they partner the ghost self-pairs)
-        assert n == 1 or f'<geom name="{lead}"' in xml, \
-            f"collision geom {lead} not found"
-    # the collision default class is sphere; fromto-based geoms are capsules
-    xml = re.sub(r'(<geom name="[a-z_]*collision" class="collision")(?![^>]*type=)',
-                 r'\1 type="capsule"', xml)
-    body_pairs = "".join(
+    xml = mjcf.insert_pairs(xml, [
         f'<pair name="box_{g}" geom1="largebox_geom" geom2="{g}" '
-        f'solref="0.008 1" friction="1 1" condim="3" />\n    '
+        f'solref="0.008 1" friction="1 1" condim="3" />'
         for g in body_geoms
-    ) + "".join(
+    ] + [
         f'<pair name="box_{g}" geom1="largebox_geom" geom2="{g}" '
         f'solref="0.004 1" solimp="0.95 0.99 0.001" friction="2 2" '
-        f'condim="3" />\n    '
+        f'condim="3" />'
         for g in arm_geoms
-    )
-    xml = xml.replace("<!-- hand-object contact -->",
-                      body_pairs + "<!-- hand-object contact -->")
+    ])
 
     # replace the crude r=0.05 hand spheres with geometry fitted to the
     # rubber-hand visual mesh. The BrainCo template ships mesh-fitted palm
@@ -431,7 +398,7 @@ def generate_scene_xml(spec: SceneSpec, hand_geom: str = "capsule") -> str:
                              hand, xml)
             assert n == 1, f"hand geom {name} not found"
 
-    xml = harden_hand_object_pairs(xml)
+    xml = mjcf.harden_hand_object_pairs(xml)
 
     # --- terrain plateaus (Alg. 1 Stage 3) -----------------------------
     # contact partners by kind (explicit-pair-only scene). The first
@@ -476,48 +443,8 @@ def generate_scene_xml(spec: SceneSpec, hand_geom: str = "capsule") -> str:
             '<geom name="floor" size="0 0 0.01" type="plane" material="groundplane" />\n    '
             + "\n    ".join(geom_lines),
         )
-        xml = xml.replace("<!-- hand-object contact -->",
-                          "\n    ".join(pair_lines)
-                          + "\n    <!-- hand-object contact -->")
-    return size_contact_buffers(xml)
-
-
-def harden_hand_object_pairs(xml: str) -> str:
-    """Firmer grip and stiffer contact than the template default, so the
-    squeeze force develops at millimetre- rather than centimetre-scale
-    depth. Covers lh/rh plus the BrainCo template's 20 finger pairs.
-
-    The solref timeconst must respect MuJoCo's stability bound of
-    2 * timestep at the solve's 60 Hz step: below it the contact is not
-    stiffer but unrealizable, and servo-squeezed fingers sank 20-37 mm
-    into the object at solref 0.004.
-
-    condim 4 adds torsional friction about the normal — capsule fingers
-    touch a handle along a line, and without it a gripped pole spins
-    freely. The torsional coefficient has length units, ~ mu times the
-    pad radius. Sliding mu is 1.5 (rubber pad on plastic) rather than the
-    2.0 it once was, since torsion now carries the twist load."""
-    xml, n = re.subn(
-        r'(<pair name="(?:left|right)_hand\w*_object"[^>]*)'
-        r'solref="0.008 1"([^>]*)friction="1 1" condim="3"',
-        r'\g<1>solref="0.04 1" solimp="0.95 0.99 0.001"\g<2>'
-        r'friction="1.5 1.5 0.008" condim="4"',
-        xml,
-    )
-    assert n in (2, 22), f"expected 2 or 22 hand-object pairs, patched {n}"
-    return xml
-
-
-def size_contact_buffers(xml: str) -> str:
-    """mujoco_warp needs collision buffers sized to the final pair count;
-    a single pair can yield several contact points. Call last."""
-    npair = xml.count("<pair ")
-    xml = re.sub(r'<numeric data="\d+" name="max_geom_pairs" />',
-                 f'<numeric data="{max(40, npair + 3)}" '
-                 'name="max_geom_pairs" />', xml)
-    return re.sub(r'<numeric data="\d+" name="max_contact_points" />',
-                  f'<numeric data="{max(40, 2 * npair)}" '
-                  'name="max_contact_points" />', xml)
+        xml = mjcf.insert_pairs(xml, pair_lines)
+    return mjcf.size_contact_buffers(xml)
 
 
 def _mask_to_rects(mask: np.ndarray) -> List[Tuple[int, int, int, int]]:
@@ -723,156 +650,3 @@ def reconstruct_terrain(
         stats["carved_cells"] += carved
 
     return plateaus, stats
-
-
-def measure_spawn_penetration(
-    model: mujoco.MjModel, data: mujoco.MjData
-) -> Dict[str, float]:
-    """Signed-distance check of every robot collision geom against the box
-    and terrain geoms at the current state (mj_forward first) ->
-    {"<robot_geom>~<scene_geom>": depth} beyond tolerance."""
-    names = [
-        mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or ""
-        for g in range(model.ngeom)
-    ]
-    robot = [g for g, n in enumerate(names)
-             if n.endswith("_collision") or n in ROBOT_CONTACT_GEOMS]
-    scene = [g for g, n in enumerate(names)
-             if n == "largebox_geom" or n == "table"
-             or re.match(r"(table|terrain|seat)_\d+$", n)]
-    fromto = np.zeros(6)
-    pens: Dict[str, float] = {}
-    for gr in robot:
-        for gs in scene:
-            d = mujoco.mj_geomDistance(model, data, gr, gs, 0.0, fromto)
-            if d < -SPAWN_PEN_TOL:
-                pens[f"{names[gr]}~{names[gs]}"] = round(float(-d), 4)
-    return pens
-
-
-def emit_trial(
-    qpos_robot: np.ndarray,
-    meta: Dict,
-    grasp: GraspInfo,
-    out_root: Path,
-    task: str,
-    data_id: int = 0,
-    hand_geom: str = "capsule",
-    **traj_kwargs,
-) -> Optional[Path]:
-    """Write a complete trial. Returns the trial dir, or None when the
-    motion admits no scene: the robot sweeps through the box's resting
-    support, or frame 0 still spawns it > SPAWN_SKIP_PEN inside the scene
-    after the placement search."""
-    obj_qpos, spec = build_object_trajectory(meta, grasp, **traj_kwargs)
-    graph = build_interaction_graph(meta, grasp)
-    terr = reconstruct_terrain(meta, graph, spec)
-    if terr is None:
-        return None
-    spec.plateaus, terrain_stats = terr
-
-    scene_xml = generate_scene_xml(spec, hand_geom=hand_geom)
-    model = mujoco.MjModel.from_xml_string(scene_xml)
-    layout.check_scene(model)
-
-    # model layout: base + body joints at their addresses (hand joints
-    # rest at 0), box free joint last
-    qpos = np.zeros((len(qpos_robot), model.nq))
-    qpos[:, :7] = qpos_robot[:, :7]
-    qpos[:, layout.body_addr(model)] = qpos_robot[:, 7:]
-    qpos[:, -7:] = obj_qpos
-    fps = meta["fps"]
-
-    # Geometric, NOT via data.contact: the scene is explicit-pair-only, so
-    # a shin through the support slab produces no MuJoCo contact while
-    # still being a broken scene. The placement search worked in keypoint
-    # spheres; this measures the residual and vetoes the clip when even
-    # the optimized placement spawns the robot deep inside.
-    data = mujoco.MjData(model)
-    data.qpos[:] = qpos[0]
-    mujoco.mj_forward(model, data)
-    spawn_pen = measure_spawn_penetration(model, data)
-    if grasp.starts_held:
-        # holding at spawn means palm-vs-box contact by design, so only
-        # non-hand penetrations veto
-        hard_pen = {k: v for k, v in spawn_pen.items()
-                    if not (k.split("~")[0] in HAND_SPAWN_GEOMS
-                            and k.endswith("~largebox_geom"))}
-    else:
-        hard_pen = spawn_pen
-    if hard_pen and max(hard_pen.values()) > SPAWN_SKIP_PEN:
-        return None
-    if hard_pen:
-        spec.flags.append("spawn_penetration")
-
-    task_dir = (
-        Path(out_root) / "processed" / "kimodo" / "unitree_g1"
-        / "humanoid_object" / task
-    )
-    trial_dir = task_dir / str(data_id)
-    trial_dir.mkdir(parents=True, exist_ok=True)
-    (task_dir / "scene.xml").write_text(scene_xml)
-
-    qvel = compute_qvel(model, qpos, 1.0 / fps)
-    ctrl = layout.ctrl_reference(model, qpos)
-
-    # contact reference for the solver: over the grasp window, pull the
-    # palm sites onto the box side-face centers, so holding the box is
-    # rewarded directly rather than through pose mimicry
-    T = len(qpos)
-    contact = np.zeros((T, 2))
-    contact_pos = np.zeros((T, 2, 3))
-    contact[grasp.pick_frame:grasp.release_frame + 1] = 1.0
-    for t in range(T):
-        box_p, box_q = qpos[t, -7:-4], qpos[t, -4:]
-        yaw = 2 * np.arctan2(box_q[3], box_q[0])
-        face = np.array([np.cos(yaw), np.sin(yaw), 0.0]) * spec.box.half_w
-        contact_pos[t, 0] = box_p + face   # left palm (+x_box side)
-        contact_pos[t, 1] = box_p - face   # right palm
-    site_ids = [
-        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, s)
-        for s in ("left_palm", "right_palm")
-    ]
-    assert -1 not in site_ids, "palm sites missing from scene"
-
-    np.savez(
-        trial_dir / "trajectory_kinematic.npz",
-        qpos=qpos, qvel=qvel, ctrl=ctrl,
-        contact=contact, contact_pos=contact_pos,
-        # SceneBot-style per-link labels: KEY_LINKS x {terrain, object}
-        link_contact=graph.link_contact.astype(np.float32),
-        link_pos=graph.link_pos.astype(np.float32),
-    )
-    info = {
-        "task_type": "box_carry",
-        "ref_dt": 1.0 / fps,
-        "contact_site_ids": site_ids,
-        "source_npz": meta["file_path"],
-        "pick_frame": grasp.pick_frame,
-        "release_frame": grasp.release_frame,
-        "starts_held": bool(grasp.starts_held),
-        "box_width": grasp.box_width,
-        "raw_carry_gap": grasp.raw_carry_gap,
-        "lift_height": grasp.lift_height,
-        "quality_flags": grasp.quality_flags,
-        "has_table": bool(spec.has_table),
-        "table_top_z": (float(spec.table_center[2] + spec.table_half[2])
-                        if spec.has_table else 0.0),
-        "box_size": [spec.box.half_w * 2, spec.box.half_d * 2, spec.box.half_h * 2],
-        "box_mass": spec.box.mass,
-        "box_placement": spec.placement,
-        "spawn_penetration": spawn_pen,
-        # interaction-graph / terrain reconstruction (general motion)
-        "key_links": list(KEY_LINKS),
-        "scene_types": list(SCENE_TYPES),
-        "graph_flags": graph.flags + spec.flags,
-        "terrain_geoms": [
-            {"kind": p.kind, "center": [round(float(v), 4) for v in p.center],
-             "half": [round(float(v), 4) for v in p.half],
-             "yaw": round(float(p.yaw), 4)}
-            for p in spec.plateaus
-        ],
-        **terrain_stats,
-    }
-    (task_dir / "task_info.json").write_text(json.dumps(info, indent=2))
-    return trial_dir

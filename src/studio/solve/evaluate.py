@@ -14,6 +14,8 @@ from typing import Optional
 
 import numpy as np
 
+from .spec import SolveScene
+
 RESULT_NPZ = "trajectory_mjwp.npz"
 REFERENCE_NPZ = "trajectory_kinematic.npz"
 
@@ -60,10 +62,10 @@ def evaluate_task(task_dir: Path,
     # last in qpos (layout.check_scene), hence the negative indexing.
     idx = np.minimum(np.arange(len(q)) // 2, len(rq) - 1)
     op = np.linalg.norm(q[:, -7:-4] - rq[idx, -7:-4], axis=1)
-    if info.get("task_type", "").startswith("pole"):
-        # axis TILT only: the reference's roll about the handle is a
-        # parallel-transport artifact of _axis_quats, not data, and a
-        # capsule handle cannot hold spin anyway
+    if SolveScene.from_info(info).axial:
+        # axis TILT only: an axially symmetric object's roll about its
+        # own axis is not data (a pole's is a parallel-transport
+        # artifact of the recon, and a capsule handle cannot hold spin)
         za, zr = _body_z(q[:, -4:]), _body_z(rq[idx, -4:])
         orot = np.arccos(np.sum(za * zr, axis=1).clip(-1, 1))
     else:

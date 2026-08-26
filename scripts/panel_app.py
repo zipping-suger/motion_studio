@@ -2,10 +2,12 @@
 
 Pick a motion from raw_motion/ — it previews immediately — and pick the
 downstream task. Button 1 reconstructs the scene with the params set in
-the GUI, button 2 solves it: box_carry, ground_pick and pole run
-studio.solve, the obstacle tasks (under_table, kick) run
-studio.solve.mppi_loop. Then watch reference (transparent) vs solution
-(solid) playback.
+the GUI, button 2 solves it with studio.solve. Then watch reference
+(transparent) vs solution (solid) playback. Every task is driven
+through studio.tasks: its controls are built from the task's scene
+defaults and choices, its preview from the task's detector, so a new
+task shows up here without a line of panel code (box_carry alone keeps
+its contact-window controls and ghost-box preview).
 
 Every action works inside an ordinary studio run dir (runs/<name>/), so
 list/view/promote all apply.
@@ -15,7 +17,6 @@ Runs in the solve venv, which has viser + mujoco + SPIDER: launch with
 """
 
 import argparse
-import json
 import os
 import re
 import subprocess
@@ -31,22 +32,19 @@ STUDIO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(STUDIO_ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling scripts
 
-from studio import manifest, recon, shim, solve, viz
+from studio import manifest, runner, shim, viz
 from studio import tasks as studio_tasks
-from studio.config import (PICK_GRASPS, PICK_SCENE_DEFAULTS, PICK_SHAPES,
-                           POLE_OBJECTS, POLE_SCENE_DEFAULTS,
-                           RAW_MOTION_DIR, RUNS_DIR, SCENE_DEFAULTS,
+from studio.config import (RAW_MOTION_DIR, RUNS_DIR, SCENE_DEFAULTS,
                            SOLVE_DEFAULTS, SOLVE_INT_KEYS, load_config,
                            task_dirs)
+from studio.recon import assets, layout
 from studio.recon.grasp import (BOX_WIDTH_MAX, BOX_WIDTH_MIN,
                                 HAND_SURFACE_OFFSET, detect_grasp)
-from studio.recon import layout
-from studio.recon import pick as recon_pick
-from studio.recon import pole as recon_pole
 from studio.recon.loader import (DOF_NAMES, KIM_LEFT_HAND_TIP,
                                  KIM_RIGHT_HAND_TIP, load_kimodo_npz)
 from studio.recon.signal import smooth
-from studio.tasks import kick_params, under_table_params
+from studio.solve import evaluate
+from studio.solve.spider_cfg import FIXED as SOLVE_FIXED
 
 import mujoco
 import viser
@@ -54,45 +52,16 @@ from viser.extras import ViserUrdf
 import yourdfpy
 
 CFG = load_config()
+# the solve's own timestep: knot_dt has to land on a whole one of these,
+# so its widget steps by it
+SIM_DT = SOLVE_FIXED["sim_dt"]
 # the BrainCo-hand model when its assets are installed, else the handless
 # 29-DoF URDF. The motion drives the same 29 body DOFs either way; finger
 # joints follow a trial's qpos and hold rest in raw previews.
-G1_URDF = str(recon.assets.G1_BRAINCO_URDF
-              if recon.assets.brainco_available() else recon.assets.G1_URDF)
-MESHES_DIR = str(recon.assets.MESHES_DIR)
-
-# the obstacle tasks the panel drives and the params it exposes; the full
-# sets live in the *_params modules and everything else stays default
-OBSTACLE_TASKS = {
-    "under_table": {
-        "params": under_table_params,
-        "suffix": "ut",              # run name: <clip>_<suffix>
-        "estimate": "1. Estimate table",
-        "scene_keys": ("scene_seed", "hard_collision", "arm_conflict",
-                       "underside_drop", "max_ref_table_pen", "yaw_range",
-                       "table_width"),
-        "solve_keys": ("num_samples", "max_num_iterations", "temperature",
-                       "horizon", "sdf_weight", "collision_margin",
-                       "collision_inner_scale", "collision_count_weight",
-                       "stability_weight", "leg_noise_scale"),
-    },
-    "kick": {
-        "params": kick_params,
-        "suffix": "kick",
-        "estimate": "1. Place kick obstacle",
-        "scene_keys": ("scene_seed", "hard_collision", "path_frac",
-                       "max_ref_pen", "box_depth", "box_width",
-                       "min_box_height"),
-        "solve_keys": ("num_samples", "max_num_iterations", "temperature",
-                       "horizon", "sdf_weight", "collision_margin",
-                       "collision_inner_scale", "collision_count_weight",
-                       "stability_weight", "leg_noise_scale", "qw_legs"),
-    },
-}
-# first primitive (slab / kick box) darker, table legs lighter, mirroring
-# the injected scene rgba
-OBSTACLE_COLORS = [(140, 89, 51), (115, 71, 38)]
-
+G1_URDF = str(assets.G1_BRAINCO_URDF
+              if assets.brainco_available() else assets.G1_URDF)
+MESHES_DIR = str(assets.MESHES_DIR)
+BOX_TASK = studio_tasks.load(studio_tasks.DEFAULT)
 
 # lh/rh palms plus, on the BrainCo model, the per-finger-segment capsules
 HAND_GEOM_RE = re.compile(r"^[lr]h(_|$)")
@@ -163,11 +132,26 @@ def object_collision_geoms(scene_xml):
             lambda s: trimesh.creation.icosphere(radius=s[0]),
     }
     for g in range(m.ngeom):
+        if m.geom_bodyid[g] != bid:
+            continue
+        name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g) or f"geom{g}"
+        if (m.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH
+                and name.startswith("largebox_c")):
+            # a chair trial's convex hulls: real collision geoms, drawn
+            # from the compiled mesh data (the geom's pos/quat place them)
+            mid = m.geom_dataid[g]
+            va, nv = m.mesh_vertadr[mid], m.mesh_vertnum[mid]
+            fa, nf = m.mesh_faceadr[mid], m.mesh_facenum[mid]
+            names.append(name)
+            meshes.append(trimesh.Trimesh(m.mesh_vert[va:va + nv],
+                                          m.mesh_face[fa:fa + nf],
+                                          process=False))
+            offsets.append((m.geom_pos[g].copy(), m.geom_quat[g].copy()))
+            continue
         build = builders.get(m.geom_type[g])
-        if m.geom_bodyid[g] != bid or build is None:
+        if build is None:
             continue  # the visual mesh, or an unknown primitive
-        names.append(mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g)
-                     or f"geom{g}")
+        names.append(name)
         meshes.append(build(m.geom_size[g]))
         offsets.append((m.geom_pos[g].copy(), m.geom_quat[g].copy()))
     return names, meshes, offsets
@@ -179,6 +163,20 @@ def list_sources():
     RAW_MOTION_DIR.mkdir(exist_ok=True)
     return {str(f.relative_to(RAW_MOTION_DIR).with_suffix("")): f
             for f in sorted(RAW_MOTION_DIR.rglob("*.npz"))}
+
+
+def solve_widget(gui, key, val, int_keys, coarse=False):
+    """One solve-param number box.
+
+    knot_dt is the odd one out: it must land on a whole sim step and tile
+    the horizon, so it steps by sim_dt and bottoms out there (the solver
+    snaps whatever it gets — see solve.spider_cfg.snap_knot_dt)."""
+    if key in int_keys:
+        return gui.add_number(key, int(val), min=1, step=max(1, int(val) // 16))
+    if key == "knot_dt":
+        return gui.add_number(key, float(val), min=SIM_DT, step=SIM_DT)
+    return gui.add_number(key, float(val), min=0.0,
+                          step=1.0 if coarse and val >= 10 else 0.05)
 
 
 class Panel:
@@ -293,7 +291,8 @@ class Panel:
         # same controls as the demo's "Scene recon" folder
         self.folder_box_scene = gui.add_folder("Scene reconstruction")
         with self.folder_box_scene:
-            self.scene_widgets = viz.scene_param_widgets(gui, SCENE_DEFAULTS)
+            self.scene_widgets = viz.scene_param_widgets(
+                gui, SCENE_DEFAULTS, BOX_TASK.choices)
             self.gui_held = gui.add_checkbox("allow held start", False)
             # auto-detected on preview, freely editable; the ghost box
             # shows the object trajectory the window implies
@@ -305,109 +304,37 @@ class Panel:
 
         self.folder_box_solve = gui.add_folder("SBMPC solve")
         with self.folder_box_solve:
-            self.solve_widgets = {}
-            for key, val in SOLVE_DEFAULTS.items():
-                if key in SOLVE_INT_KEYS:
-                    self.solve_widgets[key] = gui.add_number(
-                        key, int(val), min=1, step=max(1, int(val) // 16))
-                else:
-                    self.solve_widgets[key] = gui.add_number(
-                        key, float(val), min=0.0, step=0.05)
+            self.solve_widgets = {
+                key: solve_widget(gui, key, val, SOLVE_INT_KEYS)
+                for key, val in SOLVE_DEFAULTS.items()}
             self.btn_solve = gui.add_button("2. Solve SBMPC")
             self.btn_solve.disabled = True
             self.solve_progress = gui.add_progress_bar(0.0, visible=False)
             self.md_solve = gui.add_markdown("*reconstruct first*")
 
-        # ground_pick: object params + box_carry's SBMPC solve controls
-        self.folder_pick = gui.add_folder("ground_pick task", visible=False)
-        with self.folder_pick:
-            self.pick_scene_widgets = {}
-            choices = {"shape": PICK_SHAPES, "grasp": PICK_GRASPS}
-            for key, val in PICK_SCENE_DEFAULTS.items():
-                if key in choices:
-                    self.pick_scene_widgets[key] = gui.add_dropdown(
-                        key, choices[key], initial_value=val)
-                else:
-                    self.pick_scene_widgets[key] = gui.add_number(
-                        key, float(val), min=0.0, step=0.01)
-            self.btn_pick_recon = gui.add_button("1. Reconstruct pick scene")
-            self.md_pick_recon = gui.add_markdown("*no reconstruction yet*")
-            self.pick_solve_widgets = {}
-            for key, val in SOLVE_DEFAULTS.items():
-                if key in SOLVE_INT_KEYS:
-                    self.pick_solve_widgets[key] = gui.add_number(
-                        key, int(val), min=1, step=max(1, int(val) // 16))
-                else:
-                    self.pick_solve_widgets[key] = gui.add_number(
-                        key, float(val), min=0.0, step=0.05)
-            self.btn_pick_solve = gui.add_button("2. Solve SBMPC")
-            self.btn_pick_solve.disabled = True
-            self.pick_progress = gui.add_progress_bar(0.0, visible=False)
-            self.md_pick_solve = gui.add_markdown("*reconstruct first*")
-
-        # pole: object/mode params + the same SBMPC solve controls
-        self.folder_pole = gui.add_folder("pole task", visible=False)
-        with self.folder_pole:
-            self.pole_scene_widgets = {}
-            choices = {"object": POLE_OBJECTS, "grasp": PICK_GRASPS}
-            for key, val in POLE_SCENE_DEFAULTS.items():
-                if key in choices:
-                    self.pole_scene_widgets[key] = gui.add_dropdown(
-                        key, choices[key], initial_value=val)
-                elif isinstance(val, str):
-                    # free-form: auto | off | S-E frames
-                    self.pole_scene_widgets[key] = gui.add_text(
-                        key, initial_value=val)
-                else:
-                    self.pole_scene_widgets[key] = gui.add_number(
-                        key, float(val), min=0.0, step=0.01)
-            self.btn_pole_recon = gui.add_button("1. Reconstruct pole scene")
-            self.md_pole_recon = gui.add_markdown("*no reconstruction yet*")
-            self.pole_solve_widgets = {}
-            for key, val in SOLVE_DEFAULTS.items():
-                if key in SOLVE_INT_KEYS:
-                    self.pole_solve_widgets[key] = gui.add_number(
-                        key, int(val), min=1, step=max(1, int(val) // 16))
-                else:
-                    self.pole_solve_widgets[key] = gui.add_number(
-                        key, float(val), min=0.0, step=0.05)
-            self.btn_pole_solve = gui.add_button("2. Solve SBMPC")
-            self.btn_pole_solve.disabled = True
-            self.pole_progress = gui.add_progress_bar(0.0, visible=False)
-            self.md_pole_solve = gui.add_markdown("*reconstruct first*")
-
-        self.obs = {}
-        for tname, tcfg in OBSTACLE_TASKS.items():
-            p = tcfg["params"]
+        # every other task: its scene params + the SBMPC solve controls
+        # seeded from ITS solve defaults, one folder each
+        self.tasks = {}
+        for tname in studio_tasks.names():
+            if tname == studio_tasks.DEFAULT:
+                continue
+            task = studio_tasks.load(tname)
             folder = gui.add_folder(f"{tname} task", visible=False)
-            h = {"folder": folder, "scene_widgets": {}, "solve_widgets": {}}
+            h = {"folder": folder}
             with folder:
-                for key in tcfg["scene_keys"]:
-                    val = p.SCENE_DEFAULTS[key]
-                    if isinstance(val, bool):
-                        h["scene_widgets"][key] = gui.add_checkbox(key, val)
-                    elif key == "scene_seed":
-                        h["scene_widgets"][key] = gui.add_number(
-                            key, int(val), min=0, step=1)
-                    else:
-                        h["scene_widgets"][key] = gui.add_number(
-                            key, float(val), min=0.0, step=0.01)
-                h["btn_recon"] = gui.add_button(tcfg["estimate"])
-                h["md_recon"] = gui.add_markdown("*no scene yet*")
-                for key in tcfg["solve_keys"]:
-                    val = p.SOLVE_DEFAULTS[key]
-                    if key in p.SOLVE_INT_KEYS:
-                        h["solve_widgets"][key] = gui.add_number(
-                            key, int(val), min=1, step=max(1, int(val) // 16))
-                    else:
-                        h["solve_widgets"][key] = gui.add_number(
-                            key, float(val), min=0.0,
-                            step=1.0 if val >= 10 else 0.05)
-                h["btn_solve"] = gui.add_button("2. Solve MPPI")
+                h["scene_widgets"] = viz.scene_param_widgets(
+                    gui, task.scene_defaults, task.choices, step=0.01)
+                h["btn_recon"] = gui.add_button(
+                    f"1. Reconstruct {tname} scene")
+                h["md_recon"] = gui.add_markdown("*no reconstruction yet*")
+                h["solve_widgets"] = {
+                    key: solve_widget(gui, key, val, SOLVE_INT_KEYS)
+                    for key, val in task.solve_defaults.items()}
+                h["btn_solve"] = gui.add_button("2. Solve SBMPC")
                 h["btn_solve"].disabled = True
                 h["progress"] = gui.add_progress_bar(0.0, visible=False)
-                h["md_solve"] = gui.add_markdown("*build the scene first*")
-            self.obs[tname] = h
+                h["md_solve"] = gui.add_markdown("*reconstruct first*")
+            self.tasks[tname] = h
 
         with gui.add_folder("Playback"):
             self.gui_frame = gui.add_slider("frame", 0, 99, 1, 0)
@@ -474,30 +401,14 @@ class Panel:
         def _(_):
             self._spawn(self.do_solve)
 
-        @self.btn_pick_recon.on_click
-        def _(_):
-            self._spawn(self.do_reconstruct_pick)
-
-        @self.btn_pick_solve.on_click
-        def _(_):
-            self._spawn(self.do_solve_pick)
-
-        @self.btn_pole_recon.on_click
-        def _(_):
-            self._spawn(self.do_reconstruct_pole)
-
-        @self.btn_pole_solve.on_click
-        def _(_):
-            self._spawn(self.do_solve_pole)
-
-        for tname, h in self.obs.items():
+        for tname, h in self.tasks.items():
             # bind the task name per closure, not per loop variable
             h["btn_recon"].on_click(
                 lambda _e, tn=tname: self._spawn(
-                    lambda: self.do_reconstruct_obs(tn)))
+                    lambda: self.do_reconstruct_task(tn)))
             h["btn_solve"].on_click(
                 lambda _e, tn=tname: self._spawn(
-                    lambda: self.do_solve_obs(tn)))
+                    lambda: self.do_solve_task(tn)))
 
         self._spawn(self.do_preview)  # preview the initial selection
 
@@ -506,9 +417,7 @@ class Panel:
         box = active == "box_carry"
         self.folder_box_scene.visible = box
         self.folder_box_solve.visible = box
-        self.folder_pick.visible = active == "ground_pick"
-        self.folder_pole.visible = active == "pole"
-        for tname, h in self.obs.items():
+        for tname, h in self.tasks.items():
             h["folder"].visible = tname == active
 
     def _apply_visibility(self):
@@ -553,11 +462,7 @@ class Panel:
         self.btn_recon.disabled = busy
         self.gui_task.disabled = busy
         self.btn_solve.disabled = busy or self.task_dir is None
-        self.btn_pick_recon.disabled = busy
-        self.btn_pick_solve.disabled = busy or self.task_dir is None
-        self.btn_pole_recon.disabled = busy
-        self.btn_pole_solve.disabled = busy or self.task_dir is None
-        for h in self.obs.values():
+        for h in self.tasks.values():
             h["btn_recon"].disabled = busy
             h["btn_solve"].disabled = busy or self.task_dir is None
 
@@ -592,54 +497,26 @@ class Panel:
             self.ref_qpos = qpos  # publish LAST
             self._apply_visibility()
 
-            if self.gui_task.value in self.obs:
-                # no ghost box / contact window in obstacle modes: the
-                # scene is the estimated obstacle, drawn by button 1
-                h = self.obs[self.gui_task.value]
+            if self.gui_task.value in self.tasks:
+                # no ghost box: the task's detector says where the object
+                # will spawn; the recon draws it after button 1
+                h = self.tasks[self.gui_task.value]
+                task = studio_tasks.load(self.gui_task.value)
                 self._mid = self._yaw = self._gap = None
                 self.auto_window = None
+                try:
+                    params = task.scene_params(
+                        studio_tasks.overrides(task.name, "scene"),
+                        {k: w.value for k, w in h["scene_widgets"].items()})
+                    inter = task.recon().detect(qpos, meta, params, {})
+                    detail = inter.detail + (
+                        "" if inter.ok else f" -> {inter.skip}")
+                except Exception as e:
+                    detail = f"detection failed: {e}"
                 h["md_recon"].content = (
                     f"*previewing `{source.stem}` ({len(qpos)} frames) — "
-                    "set a seed and build the scene*")
-                h["md_solve"].content = "*build the scene first*"
-                return
-
-            if self.gui_task.value == "ground_pick":
-                # no ghost box either: the object spawns where the picking
-                # hand bottoms out, which the detector reports here
-                self._mid = self._yaw = self._gap = None
-                self.auto_window = None
-                try:
-                    info = recon_pick.detect_pick(meta)
-                    detail = (f"{info.hand} hand pick f{info.pick_frame} "
-                              f"reach {info.reach_height:.2f} "
-                              f"lift {info.lift_height:.2f} "
-                              f"flags [{','.join(info.quality_flags) or '-'}]")
-                except Exception as e:
-                    detail = f"pick detection failed: {e}"
-                self.md_pick_recon.content = (
-                    f"*previewing `{source.stem}` ({len(qpos)} frames) — "
                     f"{detail}*")
-                self.md_pick_solve.content = "*reconstruct first*"
-                return
-
-            if self.gui_task.value == "pole":
-                # no ghost box: the pole spawns under the holding hands'
-                # grasp pockets, which the detector reports here
-                self._mid = self._yaw = self._gap = None
-                self.auto_window = None
-                try:
-                    info = recon_pole.detect_pole_hold(meta, qpos)
-                    detail = (f"{'+'.join(info.hands)} hold "
-                              f"f{info.grab_frame}-f{info.end_frame} "
-                              f"transport {info.transport:.2f} "
-                              f"flags [{','.join(info.quality_flags) or '-'}]")
-                except Exception as e:
-                    detail = f"hold detection failed: {e}"
-                self.md_pole_recon.content = (
-                    f"*previewing `{source.stem}` ({len(qpos)} frames) — "
-                    f"{detail}*")
-                self.md_pole_solve.content = "*reconstruct first*"
+                h["md_solve"].content = "*reconstruct first*"
                 return
 
             # detect the window + precompute the hand-midpoint track for
@@ -672,8 +549,7 @@ class Panel:
             self.md_solve.content = "*reconstruct first*"
         except Exception as e:
             self.md_recon.content = f"**preview failed**: {e}"
-            self.md_pick_recon.content = f"**preview failed**: {e}"
-            for h in self.obs.values():
+            for h in self.tasks.values():
                 h["md_recon"].content = f"**preview failed**: {e}"
         finally:
             self._set_busy(False)
@@ -733,13 +609,13 @@ class Panel:
             if override:
                 scene_params["contact_window"] = [pick, rel]
             try:
-                task_dir, _, line = recon.reconstruct(
+                task_dir, line = BOX_TASK.reconstruct(
                     npz, run_dir / "outputs", f"{name}_00",
-                    {k: v for k, v in scene_params.items()
-                     if k in SCENE_DEFAULTS},
-                    allow_held_start=self.gui_held.value,
-                    pick=pick if override else None,
-                    release=rel if override else None)
+                    {"scene_params": {k: v for k, v in scene_params.items()
+                                      if k in SCENE_DEFAULTS},
+                     "allow_held_start": self.gui_held.value,
+                     "pick": pick if override else None,
+                     "release": rel if override else None})
             except Exception as e:
                 self.md_recon.content = f"**reconstruction crashed**: {e}"
                 self.task_dir = None
@@ -749,8 +625,10 @@ class Panel:
                 self.task_dir = None
                 return
             self.run_dir, self.task_dir = run_dir, task_dir
-            manifest.update(run_dir, {"name": name, "source": str(source),
-                                      "panel_scene_params": scene_params})
+            manifest.update(run_dir, {
+                "name": name, "source": str(source),
+                "task_type": BOX_TASK.name, "verdict": "recon",
+                "panel_scene_params": scene_params})
             self._load_reference()
             self.md_recon.content = f"```\n{line.split(' -> ')[0]}\n```"
             self.md_solve.content = "*ready to solve*"
@@ -805,93 +683,49 @@ class Panel:
         self.ref_qpos = ref_qpos  # publish LAST: handles are complete now
         self._apply_visibility()
 
-    # ---------------------------------------------- ground_pick recon --
-    def do_reconstruct_pick(self):
-        """Build a ground_pick trial. The trial keeps box_carry's contract
-        (object free joint last), so reference/result rendering is the
-        box path — only the object mesh differs."""
+    # ------------------------------------------------ any other task --
+    def do_reconstruct_task(self, tname: str):
+        """Build a trial of task `tname` from the GUI's params. Every
+        task keeps box_carry's trial contract (object free joint last),
+        so reference/result rendering is the same path — only the
+        object mesh differs."""
         source = self.sources.get(self.gui_source.value)
         if source is None:
             return
+        h = self.tasks[tname]
+        task = studio_tasks.load(tname)
         self._set_busy(True)
-        self.md_pick_recon.content = "**reconstructing ...** (takes ~10-20 s)"
+        h["md_recon"].content = "**reconstructing ...** (takes ~10-30 s)"
         try:
             # own run name: a box_carry run of the same clip may coexist
-            name = shim.sanitize(f"{source.stem}_gp")
+            name = shim.sanitize(f"{source.stem}_{tname}")
             run_dir = RUNS_DIR / name
             run_dir.mkdir(parents=True, exist_ok=True)
             motion_dir = shim.shim_motion_npz(source, run_dir)
             npz = motion_dir / f"{name}_00.npz"
 
             scene_params = {k: w.value
-                            for k, w in self.pick_scene_widgets.items()}
-            task_obj = studio_tasks.load("ground_pick")
+                            for k, w in h["scene_widgets"].items()}
             try:
-                task_dir, line = task_obj.reconstruct(
+                task_dir, line = task.reconstruct(
                     npz, run_dir / "outputs", f"{name}_00",
                     {"scene_params": scene_params})
             except Exception as e:
-                self.md_pick_recon.content = f"**reconstruction crashed**: {e}"
+                h["md_recon"].content = f"**reconstruction crashed**: {e}"
                 self.task_dir = None
                 return
             if task_dir is None:
-                self.md_pick_recon.content = (
-                    f"**failed/skipped**\n```\n{line}\n```")
+                h["md_recon"].content = f"**failed/skipped**\n```\n{line}\n```"
                 self.task_dir = None
                 return
             self.run_dir, self.task_dir = run_dir, task_dir
             manifest.update(run_dir, {
                 "name": name, "source": str(source),
-                "task_type": "ground_pick", "verdict": "recon",
+                "task_type": tname, "verdict": "recon",
                 "panel_scene_params": scene_params})
             self._load_reference()
-            self.md_pick_recon.content = f"```\n{line.split(' -> ')[0]}\n```"
-            self.md_pick_solve.content = "*ready to solve*"
-        finally:
-            self._set_busy(False)
-
-    # ---------------------------------------------------- pole recon --
-    def do_reconstruct_pole(self):
-        """Build a pole trial. The trial keeps box_carry's contract
-        (object free joint last), so reference/result rendering is the
-        box path — only the object mesh differs."""
-        source = self.sources.get(self.gui_source.value)
-        if source is None:
-            return
-        self._set_busy(True)
-        self.md_pole_recon.content = "**reconstructing ...** (takes ~10-30 s)"
-        try:
-            # own run name: a box_carry run of the same clip may coexist
-            name = shim.sanitize(f"{source.stem}_pole")
-            run_dir = RUNS_DIR / name
-            run_dir.mkdir(parents=True, exist_ok=True)
-            motion_dir = shim.shim_motion_npz(source, run_dir)
-            npz = motion_dir / f"{name}_00.npz"
-
-            scene_params = {k: w.value
-                            for k, w in self.pole_scene_widgets.items()}
-            task_obj = studio_tasks.load("pole")
-            try:
-                task_dir, line = task_obj.reconstruct(
-                    npz, run_dir / "outputs", f"{name}_00",
-                    {"scene_params": scene_params})
-            except Exception as e:
-                self.md_pole_recon.content = f"**reconstruction crashed**: {e}"
-                self.task_dir = None
-                return
-            if task_dir is None:
-                self.md_pole_recon.content = (
-                    f"**failed/skipped**\n```\n{line}\n```")
-                self.task_dir = None
-                return
-            self.run_dir, self.task_dir = run_dir, task_dir
-            manifest.update(run_dir, {
-                "name": name, "source": str(source),
-                "task_type": "pole", "verdict": "recon",
-                "panel_scene_params": scene_params})
-            self._load_reference()
-            self.md_pole_recon.content = f"```\n{line.split(' -> ')[0]}\n```"
-            self.md_pole_solve.content = "*ready to solve*"
+            h["md_recon"].content = f"```\n{line.split(' -> ')[0]}\n```"
+            h["md_solve"].content = "*ready to solve*"
         finally:
             self._set_busy(False)
 
@@ -900,21 +734,19 @@ class Panel:
         self._solve_mjwp(self.solve_widgets, self.solve_progress,
                          self.md_solve)
 
-    def do_solve_pick(self):
-        self._solve_mjwp(self.pick_solve_widgets, self.pick_progress,
-                         self.md_pick_solve)
-
-    def do_solve_pole(self):
-        self._solve_mjwp(self.pole_solve_widgets, self.pole_progress,
-                         self.md_pole_solve)
+    def do_solve_task(self, tname: str):
+        h = self.tasks[tname]
+        self._solve_mjwp(h["solve_widgets"], h["progress"], h["md_solve"])
 
     def _solve_mjwp(self, widgets, progress, md):
-        """The SBMPC solve + evaluation, shared by the box_carry and
-        ground_pick modes (same solver, different GUI handles)."""
+        """The SBMPC solve + evaluation, shared by every task mode (same
+        solver, different GUI handles)."""
         if self.task_dir is None:
             return
         self._set_busy(True)
         task = self.task_dir.name
+        task_obj = studio_tasks.load(
+            manifest.read(self.run_dir).get("task_type") or studio_tasks.DEFAULT)
         params = {k: w.value for k, w in widgets.items()}
         logs = self.run_dir / "logs"
         logs.mkdir(exist_ok=True)
@@ -928,9 +760,10 @@ class Panel:
         progress.visible = True
         try:
             proc = subprocess.Popen(
-                solve.command(CFG, task, self.run_dir / "outputs", params),
+                runner.command(CFG, task, self.run_dir / "outputs",
+                               task_obj.solve_params(params)),
                 # unbuffered child, so progress reaches the pipe per line
-                env={**os.environ, **solve.env(), "PYTHONUNBUFFERED": "1"},
+                env={**os.environ, **runner.env(), "PYTHONUNBUFFERED": "1"},
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             final = ""
             prog_re = re.compile(r"sim_steps: (\d+)/(\d+)")
@@ -953,11 +786,11 @@ class Panel:
                 md.content = f"**solve failed** — see {log_path}"
                 return
             self._load_result()
-            metrics = solve.evaluate.evaluate_task(self.task_dir)
-            row = solve.evaluate.format_row(task, metrics)
+            metrics = evaluate.evaluate_task(self.task_dir)
+            row = evaluate.format_row(task, metrics)
             manifest.update(self.run_dir, {
                 "solve_params": params,
-                "verdict": solve.evaluate.verdict([(task, metrics)]),
+                "verdict": evaluate.verdict([(task, metrics)]),
                 "eval_rows": [row]})
             md.content = (f"**{time.time() - t0:.0f}s** — {final}\n"
                           f"```\n{row}\n```")
@@ -991,157 +824,6 @@ class Panel:
         self.res_qpos = res_qpos  # publish LAST: handles are complete now
         self._apply_visibility()
 
-    # --------------------------------------- obstacle-task reconstruct --
-    def do_reconstruct_obs(self, tname: str):
-        source = self.sources.get(self.gui_source.value)
-        if source is None:
-            return
-        h = self.obs[tname]
-        self._set_busy(True)
-        h["md_recon"].content = "**building the scene ...**"
-        try:
-            # own run name: a box_carry run of the same clip may coexist
-            name = shim.sanitize(f"{source.stem}_{OBSTACLE_TASKS[tname]['suffix']}")
-            run_dir = RUNS_DIR / name
-            run_dir.mkdir(parents=True, exist_ok=True)
-            motion_dir = shim.shim_motion_npz(source, run_dir)
-            npz = motion_dir / f"{name}_00.npz"
-
-            scene_params = {k: w.value
-                            for k, w in h["scene_widgets"].items()}
-            task_obj = studio_tasks.load(tname)
-            try:
-                task_dir, line = task_obj.reconstruct(
-                    npz, run_dir / "outputs", f"{name}_00",
-                    {"scene_params": scene_params})
-            except Exception as e:
-                h["md_recon"].content = f"**estimation crashed**: {e}"
-                self.task_dir = None
-                return
-            if task_dir is None:
-                h["md_recon"].content = f"**skipped**\n```\n{line}\n```"
-                self.task_dir = None
-                return
-            self.run_dir, self.task_dir = run_dir, task_dir
-            manifest.update(run_dir, {
-                "name": name, "source": str(source),
-                "task_type": tname, "verdict": "recon",
-                "panel_scene_params": scene_params})
-            self._load_reference_obs(tname)
-            h["md_recon"].content = f"```\n{line.split(' -> ')[0]}\n```"
-            h["md_solve"].content = "*ready to solve*"
-        finally:
-            self._set_busy(False)
-
-    def _load_reference_obs(self, tname: str):
-        """Reference playback + the estimated obstacle boxes."""
-        self._clear_ghost()
-        info = json.loads((self.task_dir / "task_info.json").read_text())
-        ref_qpos = np.load(
-            self.task_dir / "0/trajectory_kinematic.npz")["qpos"]  # (T, nq)
-        # unpublish first: tick() runs in the main thread and must not
-        # touch handles while they are being rebuilt
-        self.ref_qpos = None
-        self.res_qpos = None
-        self.hand_poses = None
-        for h in (self.scene_handles + self.hand_handles
-                  + self.obj_col_handles):
-            h.remove()
-        self.scene_handles, self.hand_handles = [], []
-        self.obj_col_handles, self.obj_col_offsets = [], []
-        if self.res_base is not None:
-            self.res_base.visible = False
-        for attr in ("res_box", "ref_box"):
-            handle = getattr(self, attr)
-            if handle is not None:
-                handle.remove()
-                setattr(self, attr, None)
-
-        for i, prim in enumerate(info["primitives"]):
-            _typ, pos, prm = prim
-            color = OBSTACLE_COLORS[min(i, 1)]
-            mesh = trimesh.creation.box(
-                (2 * prm[0], 2 * prm[1], 2 * prm[2]))
-            half = prm[3] / 2
-            self.scene_handles.append(self.server.scene.add_mesh_simple(
-                f"/obstacle_{i}", mesh.vertices, mesh.faces, color=color,
-                opacity=0.9, position=np.asarray(pos, dtype=np.float64),
-                wxyz=(np.cos(half), 0.0, 0.0, np.sin(half))))
-        self._reset_frame_slider(len(ref_qpos))
-        self._load_q_addr()
-        self.ref_has_box = False  # robot-only model layout
-        self.ref_qpos = ref_qpos  # publish LAST: handles are complete now
-        self._apply_visibility()
-
-    # ------------------------------------------------ obstacle-task solve --
-    def do_solve_obs(self, tname: str):
-        if self.task_dir is None:
-            return
-        h = self.obs[tname]
-        self._set_busy(True)
-        task = self.task_dir.name
-        task_obj = studio_tasks.load(tname)
-        params = {k: w.value for k, w in h["solve_widgets"].items()}
-        logs = self.run_dir / "logs"
-        logs.mkdir(exist_ok=True)
-        log_path = logs / f"solve_{task}.log"
-        t0 = time.time()
-        h["md_solve"].content = "solving ..."
-        # animated until the first receding-horizon step reports; warp
-        # kernel compilation runs first and emits no progress
-        h["progress"].value = 0.0
-        h["progress"].animated = True
-        h["progress"].visible = True
-        try:
-            proc = subprocess.Popen(
-                task_obj.solve_command(CFG, task, self.run_dir / "outputs",
-                                       params),
-                env={**os.environ, **solve.env(), "PYTHONUNBUFFERED": "1"},
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            final = ""
-            prog_re = re.compile(r"sim_steps: (\d+)/(\d+)")
-            with open(log_path, "w") as log:
-                for i, line in enumerate(proc.stdout):
-                    log.write(line)
-                    if line.startswith("Final"):
-                        final = line.strip().split(" -> ")[0]
-                    m = prog_re.search(line)
-                    if m:
-                        cur, tot = int(m.group(1)), int(m.group(2))
-                        h["progress"].animated = False
-                        h["progress"].value = 100.0 * cur / max(tot, 1)
-                        h["md_solve"].content = (
-                            f"solving ... {time.time() - t0:.0f}s "
-                            f"({cur}/{tot} sim steps)")
-                    elif i % 25 == 0:
-                        h["md_solve"].content = (
-                            f"solving ... {time.time() - t0:.0f}s")
-            if proc.wait() != 0:
-                h["md_solve"].content = f"**solve failed** — see {log_path}"
-                return
-            self._load_result_obs()
-            rows = task_obj.evaluate([self.task_dir])
-            row = task_obj.format_row(*rows[0])
-            manifest.update(self.run_dir, {
-                "solve_params": params,
-                "verdict": task_obj.verdict(rows),
-                "eval_rows": [row]})
-            h["md_solve"].content = (
-                f"**{time.time() - t0:.0f}s** — {final}\n```\n{row}\n```")
-        finally:
-            h["progress"].visible = False
-            self._set_busy(False)
-
-    def _load_result_obs(self):
-        res_qpos = np.load(
-            self.task_dir / "0/trajectory_aug.npz")["aug_qpos"]  # (S, nq)
-        if self.res_base is None:
-            self.res_base, self.res_vis, _ = self._add_robot("res_robot")
-        self.hand_poses = None
-        self.res_has_box = False
-        self.res_qpos = res_qpos  # publish LAST
-        self._apply_visibility()
-
     # ------------------------------------------------------ open a run --
     def open_run(self, name: str):
         """Load an already-solved run: reference, scene, and result if the
@@ -1151,11 +833,11 @@ class Panel:
         trial_dirs = task_dirs(run_dir)
         if not trial_dirs:
             self.md_recon.content = f"**no built trial under** `{run_dir}`"
-            self.md_pick_recon.content = self.md_recon.content
-            for h in self.obs.values():
+            for h in self.tasks.values():
                 h["md_recon"].content = self.md_recon.content
             return
-        task_type = manifest.read(run_dir).get("task_type") or "box_carry"
+        task_type = (manifest.read(run_dir).get("task_type")
+                     or studio_tasks.DEFAULT)
         self._set_busy(True)
         try:
             self._suppress_task_cb = True
@@ -1164,35 +846,20 @@ class Panel:
             self._apply_task_mode()
             self.run_dir, self.task_dir = run_dir, trial_dirs[0]
 
-            if task_type in self.obs:
-                h = self.obs[task_type]
-                task_obj = studio_tasks.load(task_type)
-                self._load_reference_obs(task_type)
-                rows = task_obj.evaluate([self.task_dir])
-                if rows[0][1] is None:
-                    h["md_solve"].content = "*not solved yet — ready to solve*"
-                else:
-                    self._load_result_obs()
-                    h["md_solve"].content = (
-                        f"```\n{task_obj.format_row(*rows[0])}\n```")
-                h["md_recon"].content = (
-                    f"*opened run* `{name}` ({trial_dirs[0].name})")
-                return
-
-            # box_carry, ground_pick and pole share the load/solve path
-            md_recon, md_solve = {
-                "ground_pick": (self.md_pick_recon, self.md_pick_solve),
-                "pole": (self.md_pole_recon, self.md_pole_solve),
-            }.get(task_type, (self.md_recon, self.md_solve))
+            if task_type in self.tasks:
+                h = self.tasks[task_type]
+                md_recon, md_solve = h["md_recon"], h["md_solve"]
+            else:
+                md_recon, md_solve = self.md_recon, self.md_solve
             self._load_reference()
-            metrics = solve.evaluate.evaluate_task(self.task_dir)
+            metrics = evaluate.evaluate_task(self.task_dir)
             if metrics is None:
                 md_solve.content = "*not solved yet — ready to solve*"
             else:
                 self._load_result()
                 md_solve.content = (
                     f"```\n"
-                    f"{solve.evaluate.format_row(trial_dirs[0].name, metrics)}"
+                    f"{evaluate.format_row(trial_dirs[0].name, metrics)}"
                     f"\n```")
             md_recon.content = f"*opened run* `{name}` ({trial_dirs[0].name})"
         finally:

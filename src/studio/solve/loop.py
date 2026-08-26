@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 
@@ -57,6 +58,7 @@ from spider.simulators.mjwp import (
 from . import spider_cfg
 from .rewards import make_reward_fns
 from .rollout import make_rollout_fn, skip_zero_perturbation
+from .spec import SolveScene
 
 RESULT_NPZ = "trajectory_mjwp.npz"
 CONFIG_JSON = "solve_config.json"
@@ -88,6 +90,28 @@ def _obj_weight_profile(config, task_info, n_steps):
     into_mid = torch.minimum(t - (grab * k + hold),
                              (release * k - hold) - t) / ramp
     return end + (mid - end) * into_mid.clamp(0.0, 1.0)
+
+
+def _support_channel(config, task_info, mj_model, n_steps):
+    """(geom -> support group lookup, group count, per-step gates (n,
+    G)) from task_info's `supports`: one group per body geom the
+    reference rests the object on, its gate 1 over the frames it does."""
+    import torch
+    sups = task_info.get("supports") or []
+    groups = sorted({s["geom"] for s in sups})
+    geom_supp = np.full(mj_model.ngeom, -1, dtype=np.int64)
+    for gi, name in enumerate(groups):
+        g = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        if g >= 0:
+            geom_supp[g] = gi
+    gates = torch.zeros((n_steps, max(len(groups), 1)), device=config.device)
+    k = float(task_info.get("ref_dt", config.sim_dt)) / config.sim_dt
+    for s_ in sups:
+        gi = groups.index(s_["geom"])
+        a = int(round(s_["start"] * k))
+        b = min(int(round((s_["end"] + 1) * k)), n_steps)
+        gates[a:b, gi] = 1.0
+    return geom_supp, len(groups), gates
 
 
 def _env_params(config) -> list[list[dict]]:
@@ -138,21 +162,25 @@ def solve(config) -> dict:
     (Path(config.output_dir) / CONFIG_JSON).write_text(
         json.dumps(spider_cfg.summarize(config), indent=2, default=str) + "\n")
 
-    # box_half turns on the face contact term: palms target the SIMULATED
-    # box's grasp faces. box_carry only — ground_pick reuses the largebox
-    # names for a one-hand object, where both palms on side faces is wrong.
+    # everything task-specific about this solve arrives as data in the
+    # trial's task_info (see spec.SolveScene); no task is known by name
     info_path = Path(config.model_path).parent / "task_info.json"
     task_info = (json.loads(info_path.read_text())
                  if info_path.exists() else {})
-    task_type = task_info.get("task_type", "box_carry")
+    scene = SolveScene.from_info(task_info)
+
+    # box_half turns on the face contact term: palms target the SIMULATED
+    # object's grasp faces, which only a trial declaring `object.faces`
+    # has (a one-hand pick reuses the largebox names for an object where
+    # both palms on side faces would be wrong)
     box_gid = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM,
                                 "largebox_geom")
     box_half = (mj_model.geom_size[box_gid].copy()
-                if box_gid >= 0 and task_type == "box_carry" else None)
+                if box_gid >= 0 and scene.faces else None)
 
     # damp finger-actuator exploration when the trial asks: sampled
     # wiggling pries a held object out of the grasp
-    hand_scale = task_info.get("hand_noise_scale")
+    hand_scale = scene.hand_noise_scale
     if hand_scale is not None:
         hand_kw = ("thumb", "index", "middle", "ring", "pinky")
         hand_ids = [
@@ -163,18 +191,11 @@ def solve(config) -> dict:
         if hand_ids:
             config.noise_scale[:, :, hand_ids] *= float(hand_scale)
 
-    # grip reward targets: ground_pick anchors the object center in the
-    # one picking palm, pole anchors each hand's grab height up the axis
-    grips = None
-    pocket = task_info.get("grasp_pocket")
-    if task_type == "ground_pick" and pocket is not None:
-        grips = [(pocket, 0 if task_info.get("pick_hand") == "left" else 1,
-                  None)]
-    elif task_type == "pole_carry":
-        grips = [(g["pocket"], 0 if g["hand"] == "left" else 1,
-                  g.get("anchor"))
-                 for g in task_info.get("grips") or []
-                 if g.get("pocket") is not None] or None
+    # grip reward targets: each holding hand's calibrated pocket and the
+    # object-frame anchor it holds (None = the object's origin — a small
+    # picked object; a pole anchors its grab height up the axis, a chair
+    # each hand's grab point in the chair's frame)
+    grips = scene.grips or None
 
     # the template's ghost self-collision pairs (forceless, solver-free)
     # feed the self-penetration penalty
@@ -184,13 +205,33 @@ def solve(config) -> dict:
         if (mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_PAIR, p) or ""
             ).startswith("self_")]
 
-    reward_fn, terminal_reward_fn = make_reward_fns(
-        config, box_half=box_half, grips=grips, self_pairs=self_pairs)
+    # the grasp term's geom lookups: palm boxes + finger capsules per
+    # hand column, and every object collision geom (the box/handle
+    # capsule, or a chair's hulls)
+    geom_hand = np.full(mj_model.ngeom, -1, dtype=np.int64)
+    geom_obj = np.zeros(mj_model.ngeom, dtype=bool)
+    for g in range(mj_model.ngeom):
+        name = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_GEOM, g) or ""
+        if re.fullmatch(r"[lr]h(_\w+)?", name):
+            geom_hand[g] = 0 if name[0] == "l" else 1
+        elif name == "largebox_geom" or name.startswith("largebox_c"):
+            geom_obj[g] = True
 
-    # the per-step object weight rides along as a 6th reference channel;
-    # setup_env above already took the 5-tuple SPIDER expects
+    # body supports (a chair on the hip, a box on the forearms): the
+    # geoms the reference rests the object on, gated over their windows
+    geom_supp, n_supp, supp_gates = _support_channel(
+        config, task_info, mj_model, qpos_ref.shape[0])
+
+    reward_fn, terminal_reward_fn = make_reward_fns(
+        config, box_half=box_half, grips=grips, self_pairs=self_pairs,
+        grasp=(geom_hand, geom_obj), support=(geom_supp, n_supp))
+
+    # the per-step object weight rides along as a 6th reference channel,
+    # the support gates as a 7th; setup_env above already took the
+    # 5-tuple SPIDER expects
     ref_data = (*ref_data,
-                _obj_weight_profile(config, task_info, qpos_ref.shape[0]))
+                _obj_weight_profile(config, task_info, qpos_ref.shape[0]),
+                supp_gates)
 
     skip_zero_perturbation(config)
     rollout = make_rollout_fn(

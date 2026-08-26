@@ -17,14 +17,13 @@ wrapping its axis. Either way this is only initialization — the solve's
 grip reward holds the SIMULATED object in the palm pocket, so MPPI is
 free to adapt.
 
-The trial layout matches scene.emit_trial exactly and the object keeps
-the template's largebox names, so the hand-object pairs, the solve and
-the evaluator apply verbatim. task_info's ``task_type: ground_pick``
-tells the solve loop to skip the bimanual box-face palm reward and use
-SPIDER's baked contact reference instead.
+The object keeps the template's largebox names, so the hand-object
+pairs apply verbatim; the trial declares one grip (the picking palm's
+pocket, no anchor) and no box faces, which is all the solve needs to
+know (see recon.spec / solve.spec). `TASK` is the ReconTask
+(recon.run) the ground_pick task runs through.
 """
 
-import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,15 +32,15 @@ from typing import Dict, List, Optional, Tuple
 import mujoco
 import numpy as np
 
-from . import assets, layout
-from .graph import KEY_LINKS, SCENE_TYPES, build_interaction_graph
-from .grasp import GraspInfo, hand_tracks
-from .loader import DOF_NAMES, compute_qvel
-from .table import robot_model
-from .scene import (SPAWN_SKIP_PEN, harden_hand_object_pairs,
-                    measure_spawn_penetration, size_contact_buffers,
-                    yaw_quat_wxyz)
+from . import assets, layout, mjcf
+from .grasp import hand_tracks
+from .loader import DOF_NAMES
+from .objects import GRASPS, SHAPES
+from .robot import robot_model
+from .scene import yaw_quat_wxyz
 from .signal import smooth
+from .spec import (Built, Grip, Interaction, ObjectSpec, TrialSpec,
+                   assemble_qpos, palm_site_ids)
 
 REACH_MAX = 0.35     # m: the picking hand tip must dip below this
 HAND_MARGIN = 0.03   # m: the other hand must stay this much higher
@@ -75,7 +74,6 @@ WRAP_POCKET_OUT = 0.002  # m: extra palm clearance beyond the radius.
                          # grasp into a fingertip cage. Slimmer objects
                          # get the full wrap naturally.
 
-GRASPS = ("auto", "reference", "ik_retargeted")
 SIDE_BLEND_S = 0.4       # s: wrist-orientation blend-in ahead of the pick
 HOLD_PAD_S = 1.2         # s of frozen held pose appended to the reference,
                          # so the receding horizon has a full window at
@@ -98,7 +96,6 @@ YAW_SWEEP = tuple(np.radians((0.0, 30.0, -30.0, 60.0, -60.0, 90.0, -90.0)))
 # the arm — a 7-joint whole-arm solve visibly contorted stooping clips
 WRIST_JOINTS = ("wrist_roll", "wrist_pitch", "wrist_yaw")
 
-SHAPES = ("cube", "cylinder", "ball")
 # shape="auto" reads the clip name: the prompts name the object and the
 # npz itself carries no text
 SHAPE_KEYWORDS = (("ball", "ball"), ("sphere", "ball"), ("cube", "cube"),
@@ -787,16 +784,15 @@ def generate_pick_scene_xml(shape: str, size: float, cyl_height: float,
       <geom name="largebox_geom" type="{gtype}" size="{size_attr}"
         class="visual" material="black" rgba="0.72 0.45 0.20 1" />{grip}
     </body>'''
-    xml, n = re.subn(r'<body name="largebox".*?</body>', body, xml, flags=re.S)
-    assert n == 1, "largebox body not found in template"
+    xml = mjcf.replace_object_body(xml, body)
     if gtype == "cylinder":
         xml, n = re.subn(
             r'(<pair name="(?:left|right)_hand\w*_object"[^>]*geom2=")'
             r'largebox_geom(")',
             r'\1largebox_grip\2', xml)
         assert n in (2, 22), f"expected 2 or 22 hand pairs, re-pointed {n}"
-    xml = harden_hand_object_pairs(xml)
-    return size_contact_buffers(xml)
+    xml = mjcf.harden_hand_object_pairs(xml)
+    return mjcf.size_contact_buffers(xml)
 
 
 # --------------------------------------------------------------- trial --
@@ -822,6 +818,140 @@ def _close_fingers(model, qpos: np.ndarray, pick: PickInfo,
         qpos[:, adr] = angle
 
 
+class PickTask:
+    """ground_pick as a ReconTask (recon.run)."""
+
+    name = "ground_pick"
+
+    def detect(self, qpos, meta, params, options) -> Interaction:
+        info = detect_pick(meta)
+        shape = infer_shape(Path(meta["file_path"]).stem, str(params["shape"]))
+        detail = (f"{info.hand} hand pick f{info.pick_frame} "
+                  f"end f{info.end_frame} reach {info.reach_height:.2f} "
+                  f"lift {info.lift_height:.2f} {shape} "
+                  f"flags [{','.join(info.quality_flags) or '-'}]")
+        return Interaction(info.ok, detail, "no clean one-hand pick",
+                           info=info, object=shape)
+
+    def build(self, qpos_robot, meta, inter: Interaction, params) -> Built:
+        """The scene and reference of one ground-pick trial. grasp_close
+        overrides the calibrated touch closure; grasp is the mode (auto =
+        ik_retargeted for cylinders, reference otherwise)."""
+        pick: PickInfo = inter.info
+        shape = inter.object
+        size = float(params["size"])
+        cyl_height = float(params["cyl_height"])
+        mass = float(params["mass"])
+        grasp_close = float(params["grasp_close"])
+        grasp = str(params["grasp"])
+        if grasp not in GRASPS:
+            raise SystemExit(f"unknown grasp {grasp!r} "
+                             f"(use {', '.join(GRASPS)})")
+        _, _, half_h, _ = object_dims(shape, size, cyl_height)
+        grasp_mode = grasp if grasp != "auto" else (
+            "ik_retargeted" if shape == "cylinder" else "reference")
+        # the closure family follows the grasp, and calibration sweeps the
+        # same family: power wrap for ik_retargeted, pinch for reference
+        fractions = (POWER_CLOSE_FRACTION if grasp_mode == "ik_retargeted"
+                     else CLOSE_FRACTION)
+        calib = calibrate_grasp(
+            pick.hand, size, fractions,
+            wrap_radius=size / 2 if grasp_mode == "ik_retargeted" else None)
+        pocket = calib[1] if calib else None
+
+        grasp_flags: List[str] = []
+        grasp_info: Dict = {"mode": grasp_mode}
+        if grasp_mode == "ik_retargeted" and pocket is None:
+            grasp_mode = "reference"    # handless template: no wrist to re-aim
+            grasp_info = {"mode": "reference", "fallback": "no_hand_model"}
+        if grasp_mode == "ik_retargeted":
+            qpos_robot, grasp_flags, grasp_info = retarget_side_grasp(
+                qpos_robot, meta, pick, 2 * half_h, pocket, shape)
+            grasp_mode = grasp_info["mode"]     # may fall back to reference
+        if grasp_mode == "reference" and fractions is POWER_CLOSE_FRACTION:
+            fractions = CLOSE_FRACTION          # fell back: pinch closure
+            calib = calibrate_grasp(pick.hand, size, fractions)
+            pocket = calib[1] if calib else None
+        caps = calib[2] if calib else None
+        wrap = grasp_close if grasp_close > 0 else (calib[0] if calib else 0.0)
+        squeeze = WRAP_SQUEEZE if grasp_mode == "ik_retargeted" else GRIP_SQUEEZE
+        hold = wrap + squeeze if wrap > 0 else 0.0
+
+        obj_qpos, rest_pos, rest_yaw, obj_flags = build_pick_object_trajectory(
+            qpos_robot, meta, pick, half_h, pocket)
+
+        scene_xml = generate_pick_scene_xml(shape, size, cyl_height, mass,
+                                            rest_pos, rest_yaw)
+        model = mujoco.MjModel.from_xml_string(scene_xml)
+        layout.check_scene(model)
+        qpos = assemble_qpos(model, qpos_robot, obj_qpos)
+        _close_fingers(model, qpos, pick, wrap, hold, fractions, caps)
+        fps = meta["fps"]
+
+        # contact reference for SPIDER's baked contact reward (the bimanual
+        # box-face term stays off here). Reference grasp: the picking palm
+        # on the object's top. IK-retargeted: the palm at its own reference
+        # FK track, consistent with the object riding the pocket. Columns
+        # match site_ids.
+        T = len(qpos)
+        col = 0 if pick.hand == "left" else 1
+        contact = np.zeros((T, 2))
+        contact[pick.pick_frame:pick.end_frame + 1, col] = 1.0
+        site_ids = palm_site_ids(model)
+        contact_pos = np.zeros((T, 2, 3))
+        if grasp_mode == "ik_retargeted":
+            d2 = mujoco.MjData(model)
+            target = np.zeros((T, 3))
+            for t in range(T):
+                d2.qpos[:] = qpos[t]
+                mujoco.mj_kinematics(model, d2)
+                target[t] = d2.site_xpos[site_ids[col]]
+        else:
+            target = qpos[:, -7:-4] + np.array([0.0, 0.0, half_h])
+        contact_pos[:, 0] = target
+        contact_pos[:, 1] = target
+
+        # a trial that ends held is padded with HOLD_PAD_S of its frozen
+        # final pose (zero velocity), so the receding horizon has a full
+        # reference window at every evaluated frame
+        Tt = pick.end_frame + 1 if "hold_trimmed" in pick.quality_flags else None
+        pad = (int(HOLD_PAD_S * fps)
+               if "set_down" not in pick.quality_flags else 0)
+
+        spec = TrialSpec(
+            task_type="ground_pick",
+            object=ObjectSpec(
+                kind="primitive",
+                size=[size, size, cyl_height if shape == "cylinder" else size],
+                mass=mass,
+                info={"shape": shape, "extent": size, "cyl_height": cyl_height}),
+            window=(pick.pick_frame, pick.end_frame),
+            starts_held=False,
+            lift_height=pick.lift_height,
+            # the calibrated pocket (palm-site frame): the solve's grip
+            # reward holds the SIMULATED object's origin here
+            grips=[Grip(
+                hand=pick.hand, window=(pick.pick_frame, pick.end_frame),
+                pocket=pocket, anchor=None,
+                extra={"closure_touch": round(wrap, 4),
+                       "closure_hold": round(hold, 4),
+                       # per-joint caps of a conforming power wrap; None
+                       # for a pinch
+                       "closure_caps": ({k: round(float(v), 3)
+                                         for k, v in caps.items()}
+                                        if caps else None)})],
+            grasp=[{"hand": pick.hand, **grasp_info}],
+            flags=pick.quality_flags + obj_flags + grasp_flags,
+            hand_noise_scale=HAND_NOISE_SCALE,
+            extra={"reach_height": round(pick.reach_height, 4)},
+        )
+        return Built(scene_xml, model, qpos, spec, contact=contact,
+                     contact_pos=contact_pos, pad=pad, truncate=Tt)
+
+
+TASK = PickTask()
+
+
 def emit_pick_trial(
     qpos_robot: np.ndarray,
     meta: Dict,
@@ -836,167 +966,13 @@ def emit_pick_trial(
     grasp_close: float = 0.0,
     grasp: str = "auto",
 ) -> Optional[Path]:
-    """Write a complete ground-pick trial (same layout and file contract
-    as scene.emit_trial). Returns the trial dir, or None when frame 0
-    spawns the robot deep inside the scene. grasp_close overrides the
-    calibrated touch closure; grasp is the mode (auto = ik_retargeted
-    for cylinders, reference otherwise)."""
-    if grasp not in GRASPS:
-        raise SystemExit(f"unknown grasp {grasp!r} "
-                         f"(use {', '.join(GRASPS)})")
-    _, _, half_h, _ = object_dims(shape, size, cyl_height)
-    grasp_mode = grasp if grasp != "auto" else (
-        "ik_retargeted" if shape == "cylinder" else "reference")
-    # the closure family follows the grasp, and calibration sweeps the
-    # same family: power wrap for ik_retargeted, pinch for reference
-    fractions = (POWER_CLOSE_FRACTION if grasp_mode == "ik_retargeted"
-                 else CLOSE_FRACTION)
-    calib = calibrate_grasp(
-        pick.hand, size, fractions,
-        wrap_radius=size / 2 if grasp_mode == "ik_retargeted" else None)
-    pocket = calib[1] if calib else None
-
-    grasp_flags: List[str] = []
-    grasp_info: Dict = {"mode": grasp_mode}
-    if grasp_mode == "ik_retargeted" and pocket is None:
-        grasp_mode = "reference"    # handless template: no wrist to re-aim
-        grasp_info = {"mode": "reference", "fallback": "no_hand_model"}
-    if grasp_mode == "ik_retargeted":
-        qpos_robot, grasp_flags, grasp_info = retarget_side_grasp(
-            qpos_robot, meta, pick, 2 * half_h, pocket, shape)
-        grasp_mode = grasp_info["mode"]     # may fall back to reference
-    if grasp_mode == "reference" and fractions is POWER_CLOSE_FRACTION:
-        fractions = CLOSE_FRACTION          # fell back: pinch closure
-        calib = calibrate_grasp(pick.hand, size, fractions)
-        pocket = calib[1] if calib else None
-    caps = calib[2] if calib else None
-    wrap = grasp_close if grasp_close > 0 else (calib[0] if calib else 0.0)
-    squeeze = WRAP_SQUEEZE if grasp_mode == "ik_retargeted" else GRIP_SQUEEZE
-    hold = wrap + squeeze if wrap > 0 else 0.0
-
-    obj_qpos, rest_pos, rest_yaw, obj_flags = build_pick_object_trajectory(
-        qpos_robot, meta, pick, half_h, pocket)
-
-    scene_xml = generate_pick_scene_xml(shape, size, cyl_height, mass,
-                                        rest_pos, rest_yaw)
-    model = mujoco.MjModel.from_xml_string(scene_xml)
-    layout.check_scene(model)
-
-    qpos = np.zeros((len(qpos_robot), model.nq))
-    qpos[:, :7] = qpos_robot[:, :7]
-    qpos[:, layout.body_addr(model)] = qpos_robot[:, 7:]
-    qpos[:, -7:] = obj_qpos
-    _close_fingers(model, qpos, pick, wrap, hold, fractions, caps)
-    fps = meta["fps"]
-
-    data = mujoco.MjData(model)
-    data.qpos[:] = qpos[0]
-    mujoco.mj_forward(model, data)
-    spawn_pen = measure_spawn_penetration(model, data)
-    if spawn_pen and max(spawn_pen.values()) > SPAWN_SKIP_PEN:
-        return None
-
-    task_dir = (Path(out_root) / "processed" / "kimodo" / "unitree_g1"
-                / "humanoid_object" / task)
-    trial_dir = task_dir / str(data_id)
-    trial_dir.mkdir(parents=True, exist_ok=True)
-    (task_dir / "scene.xml").write_text(scene_xml)
-
-    qvel = compute_qvel(model, qpos, 1.0 / fps)
-    ctrl = layout.ctrl_reference(model, qpos)
-
-    # contact reference for SPIDER's baked contact reward (the bimanual
-    # box-face term stays off here). Reference grasp: the picking palm on
-    # the object's top. IK-retargeted: the palm at its own reference FK
-    # track, consistent with the object riding the pocket. Columns match
-    # site_ids.
-    T = len(qpos)
-    col = 0 if pick.hand == "left" else 1
-    contact = np.zeros((T, 2))
-    contact[pick.pick_frame:pick.end_frame + 1, col] = 1.0
-    site_ids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, s)
-                for s in ("left_palm", "right_palm")]
-    assert -1 not in site_ids, "palm sites missing from scene"
-    contact_pos = np.zeros((T, 2, 3))
-    if grasp_mode == "ik_retargeted":
-        d2 = mujoco.MjData(model)
-        target = np.zeros((T, 3))
-        for t in range(T):
-            d2.qpos[:] = qpos[t]
-            mujoco.mj_kinematics(model, d2)
-            target[t] = d2.site_xpos[site_ids[col]]
-    else:
-        target = qpos[:, -7:-4] + np.array([0.0, 0.0, half_h])
-    contact_pos[:, 0] = target
-    contact_pos[:, 1] = target
-
-    # a GraspInfo view of the pick, for the interaction-graph labels
-    graspish = GraspInfo(
-        pick_frame=pick.pick_frame, release_frame=pick.end_frame,
-        box_width=size, raw_carry_gap=size, lift_height=pick.lift_height,
-        quality_flags=list(pick.quality_flags))
-    graph = build_interaction_graph(meta, graspish)
-
-    # a trial that ends held is padded with HOLD_PAD_S of its frozen
-    # final pose (zero velocity), so the receding horizon has a full
-    # reference window at every evaluated frame
-    Tt = pick.end_frame + 1 if "hold_trimmed" in pick.quality_flags else T
-    pad = (int(HOLD_PAD_S * fps)
-           if "set_down" not in pick.quality_flags else 0)
-
-    def cut(a, pad_tail=None):
-        out = a[:Tt]
-        if pad:
-            tail = (np.repeat(out[-1:], pad, axis=0)
-                    if pad_tail is None else pad_tail)
-            out = np.concatenate([out, tail], axis=0)
-        return out
-
-    np.savez(
-        trial_dir / "trajectory_kinematic.npz",
-        qpos=cut(qpos),
-        qvel=cut(qvel, np.zeros((pad, qvel.shape[1]))),
-        ctrl=cut(ctrl),
-        contact=cut(contact), contact_pos=cut(contact_pos),
-        link_contact=cut(graph.link_contact).astype(np.float32),
-        link_pos=cut(graph.link_pos).astype(np.float32),
-    )
-    info = {
-        "task_type": "ground_pick",
-        "ref_dt": 1.0 / fps,
-        "contact_site_ids": site_ids,
-        "source_npz": meta["file_path"],
-        "pick_frame": pick.pick_frame,
-        "release_frame": pick.end_frame,
-        "starts_held": False,
-        "pick_hand": pick.hand,
-        "object": {"shape": shape, "size": size,
-                   "cyl_height": cyl_height, "mass": mass},
-        "closure_touch": round(wrap, 4),
-        "closure_hold": round(hold, 4),
-        # per-joint caps of a conforming power wrap; None for a pinch
-        "closure_caps": ({k: round(float(v), 3) for k, v in caps.items()}
-                         if caps else None),
-        "hand_noise_scale": HAND_NOISE_SCALE,
-        "grasp": grasp_info,
-        # the calibrated pocket (palm-site frame): the solve's grip
-        # reward holds the SIMULATED object here
-        "grasp_pocket": ([round(float(v), 4) for v in pocket]
-                         if pocket is not None else None),
-        "reach_height": round(pick.reach_height, 4),
-        "lift_height": round(pick.lift_height, 4),
-        "quality_flags": pick.quality_flags + obj_flags + grasp_flags,
-        "has_table": False,
-        "table_top_z": 0.0,
-        # bounding dims, so box-oriented viewers can still frame it
-        "box_size": [size, size,
-                     cyl_height if shape == "cylinder" else size],
-        "box_mass": mass,
-        "spawn_penetration": spawn_pen,
-        "key_links": list(KEY_LINKS),
-        "scene_types": list(SCENE_TYPES),
-        "graph_flags": graph.flags,
-        "terrain_geoms": [],
-    }
-    (task_dir / "task_info.json").write_text(json.dumps(info, indent=2))
-    return trial_dir
+    """Write a complete ground-pick trial from an already detected pick
+    (the recon.run pipeline from `build` on). Returns the trial dir, or
+    None when the motion admits no scene."""
+    from .run import emit  # late: run imports this module's siblings
+    params = {"shape": shape, "size": size, "cyl_height": cyl_height,
+              "mass": mass, "grasp_close": grasp_close, "grasp": grasp}
+    trial, _info, _why = emit(TASK, qpos_robot, meta,
+                              Interaction(True, "", info=pick, object=shape),
+                              out_root, task, params, data_id=data_id)
+    return trial

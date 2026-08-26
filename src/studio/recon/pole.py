@@ -22,33 +22,33 @@ IK (pick.wrist_ik_frame) to wrap the ESTIMATED object's axis. The wrist
 adapts to the object, never the object to the re-aimed wrist — the
 small pocket shift that causes is what the solve's grip reward absorbs.
 
-task_info's ``task_type`` (pole_carry) switches the solve loop onto the
-per-hand pocket grip reward with the pole's along-axis anchors.
+The trial declares one grip per holding hand — its pocket and its
+anchor up the pole's axis — and an axially symmetric object, which is
+all the solve and the evaluator need (recon.spec / solve.spec). `TASK`
+is the ReconTask (recon.run) the pole task runs through.
 """
 
-import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import mujoco
 import numpy as np
 
-from . import assets, layout
-from .graph import KEY_LINKS, SCENE_TYPES, build_interaction_graph
-from .grasp import GraspInfo, hand_tracks
-from .loader import compute_qvel
-from .pick import (CLOSE_LEAD, CLOSE_RAMP, GRASPS, HAND_NOISE_SCALE,
-                   HOLD_PAD_S, IK_ORI_FLAG, POWER_CLOSE_FRACTION,
-                   SIDE_BLEND_S, WRAP_SQUEEZE, YAW_SWEEP, _closure_profile,
+from . import assets, layout, mjcf
+from .grasp import hand_tracks
+from .objects import (GRASPS, OBJECT_MESH_DIR, infer_by_name, load_sidecar,
+                      pole_objects)
+from .pick import (CLOSE_LEAD, CLOSE_RAMP, HAND_NOISE_SCALE, HOLD_PAD_S,
+                   IK_ORI_FLAG, POWER_CLOSE_FRACTION, SIDE_BLEND_S,
+                   WRAP_SQUEEZE, YAW_SWEEP, _closure_profile,
                    calibrate_grasp, palm_grip_track, wrist_ik_frame,
                    wrist_setup)
-from .scene import (HAND_SPAWN_GEOMS, SPAWN_SKIP_PEN,
-                    harden_hand_object_pairs, measure_spawn_penetration,
-                    size_contact_buffers)
 from .signal import smooth, smooth3
-from .table import robot_model
+from .robot import robot_model
+from .spec import (Built, Grip, Interaction, ObjectSpec, TrialSpec,
+                   assemble_qpos)
 
 # --- detection ---------------------------------------------------------
 STEEP_MIN = 0.45      # |z| of the unit hand-hand axis
@@ -88,12 +88,11 @@ OBJECT_KEYWORDS = (("lamp", "floorlamp"),
                    ("tripod", "tripod"), ("clothesstand", "clothesstand"),
                    ("stand", "clothesstand"), ("rack", "clothesstand"))
 
-OBJECT_MESH_DIR = assets.ASSETS_DIR / "object_mesh"
-
 
 def available_objects() -> Tuple[str, ...]:
-    """The pole objects whose measured sidecar exists."""
-    return tuple(sorted(p.stem for p in OBJECT_MESH_DIR.glob("*.json")))
+    """The pole objects whose measured sidecar exists (a handle_z band
+    marks a pole; other objects sharing the dir are skipped)."""
+    return pole_objects()
 
 
 POLE_OBJECTS = available_objects()
@@ -125,21 +124,13 @@ def infer_object(clip_name: str, object_param: str) -> str:
             raise SystemExit(f"unknown pole object {object_param!r} "
                              f"(use auto, {', '.join(POLE_OBJECTS)})")
         return object_param
-    name = clip_name.lower()
     # a keyword only counts while its measured mesh is present
-    for key, obj in OBJECT_KEYWORDS:
-        if key in name and obj in POLE_OBJECTS:
-            return obj
-    return "floorlamp"
+    return infer_by_name(clip_name, OBJECT_KEYWORDS, POLE_OBJECTS, "floorlamp")
 
 
 def load_spec(name: str) -> PoleSpec:
-    path = OBJECT_MESH_DIR / f"{name}.json"
-    if not path.is_file():
-        raise SystemExit(
-            f"no pole-object spec {path}\n"
-            "  uv run python scripts/prep_object_mesh.py")
-    d = json.loads(path.read_text())
+    d = load_sidecar(name, "pole-object (uv run python "
+                           "scripts/prep_object_mesh.py)")
     return PoleSpec(
         name=d["name"],
         obj_file=OBJECT_MESH_DIR / d["obj_file"],
@@ -824,7 +815,7 @@ def generate_pole_scene_xml(spec: PoleSpec, mass: float,
     sc = spec.mesh_scale
     mesh = (f'<mesh name="pole_object" file="{spec.obj_file}" '
             f'scale="{sc:.6f} {sc:.6f} {sc:.6f}" />')
-    xml = xml.replace("</asset>", f"  {mesh}\n  </asset>")
+    xml = mjcf.add_assets(xml, [mesh])
 
     r = spec.handle_radius
     z_lo, z_hi = spec.handle_z
@@ -858,16 +849,12 @@ def generate_pole_scene_xml(spec: PoleSpec, mass: float,
         quat="{mq[0]:.6f} {mq[1]:.6f} {mq[2]:.6f} {mq[3]:.6f}"
         class="visual" material="black" rgba="0.55 0.42 0.30 1" />
     </body>'''
-    xml, n = re.subn(r'<body name="largebox".*?</body>', body, xml,
-                     flags=re.S)
-    assert n == 1, "largebox body not found in template"
-    pair = ('<pair name="largebox_base_floor" geom1="largebox_base" '
-            'geom2="floor" solref="0.008 1" friction="1 1" condim="3" />'
-            '\n    ')
-    xml = xml.replace("<!-- hand-object contact -->",
-                      pair + "<!-- hand-object contact -->")
-    xml = harden_hand_object_pairs(xml)
-    return size_contact_buffers(xml)
+    xml = mjcf.replace_object_body(xml, body)
+    xml = mjcf.insert_pairs(xml, [
+        '<pair name="largebox_base_floor" geom1="largebox_base" '
+        'geom2="floor" solref="0.008 1" friction="1 1" condim="3" />'])
+    xml = mjcf.harden_hand_object_pairs(xml)
+    return mjcf.size_contact_buffers(xml)
 
 
 # --------------------------------------------------------------- trial --
@@ -931,9 +918,23 @@ def _segment_gap(model, data, gid: int, hp: np.ndarray, hq: np.ndarray,
 
 
 def _conform_fingers(model, qpos: np.ndarray, hand: str,
-                     grab: int, end: int) -> Dict[str, float]:
+                     grab: int, end: int,
+                     gap_fn: Optional[Callable] = None,
+                     hold: float = CONFORM_HOLD,
+                     full_scan: bool = False) -> Dict[str, float]:
     """Close each finger onto the handle where it actually is. Returns
     the per-finger worst gap before the pass, in mm.
+
+    `gap_fn(model, data, finger_gids) -> surface gap` swaps the object:
+    the default measures against the largebox_geom handle capsule; the
+    chair passes its hulls (chair._hull_gap_fn). `hold` is the proximal
+    flexion a conformed finger always keeps (CONFORM_HOLD; 0 lets it
+    open fully). `full_scan` drops the handle's assumption that opening
+    clears and closing cuts in: a hand whose palm sits off the wood
+    pokes the far member with OPEN fingers and clears it by curling, so
+    every scale is probed and the most open touching pose wins, else
+    the clear pose nearest to touching, else the least overlap — never
+    the calibrated curl buried in the wood, which cages the object.
 
     calibrate_grasp caps each finger where it meets a cylinder at the
     CALIBRATION pocket, but the wrist re-aim, the pole's own drift and
@@ -948,12 +949,23 @@ def _conform_fingers(model, qpos: np.ndarray, hand: str,
     only: the palm rides on the arm, so moving it means re-solving the
     wrist IK."""
     data = mujoco.MjData(model)
-    handle = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM,
-                               "largebox_geom")
-    if handle < 0:
-        return {}
-    hr = float(model.geom_size[handle, 0])
-    hh = float(model.geom_size[handle, 1])
+    if gap_fn is None:
+        handle = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM,
+                                   "largebox_geom")
+        if handle < 0:
+            return {}
+        hr = float(model.geom_size[handle, 0])
+        hh = float(model.geom_size[handle, 1])
+
+        def gaps(finger_gids) -> float:
+            axis = data.geom_xmat[handle].reshape(3, 3)[:, 2]
+            hp = data.geom_xpos[handle] - hh * axis
+            hq = data.geom_xpos[handle] + hh * axis
+            return min(_segment_gap(model, data, g, hp, hq, hr)
+                       for g in finger_gids)
+    else:
+        def gaps(finger_gids) -> float:
+            return gap_fn(model, data, finger_gids)
 
     follow: Dict[int, list] = {}
     for eq in range(model.neq):
@@ -991,18 +1003,11 @@ def _conform_fingers(model, qpos: np.ndarray, hand: str,
         for adr, jlo, jhi in adrs:
             data.qpos[adr] = min(max(scale * row[adr], jlo), jhi)
 
-    def gaps(finger_gids) -> float:
-        hp = data.geom_xpos[handle] - hh * data.geom_xmat[handle].reshape(
-            3, 3)[:, 2]
-        hq = data.geom_xpos[handle] + hh * data.geom_xmat[handle].reshape(
-            3, 3)[:, 2]
-        return min(_segment_gap(model, data, g, hp, hq, hr)
-                   for g in finger_gids)
-
     worst: Dict[str, float] = dict.fromkeys(groups, np.inf)
     lo, hi = max(0, grab), min(len(qpos), end + 1)
     base = qpos[lo:hi].copy()
     scales = {f: np.ones(hi - lo) for f in groups}
+    chosen = {f: np.ones(hi - lo) for f in groups}   # the per-frame scan
     for i, t in enumerate(range(lo, hi)):
         for finger, (gids, adrs, prox) in groups.items():
             data.qpos[:] = qpos[t]
@@ -1022,9 +1027,22 @@ def _conform_fingers(model, qpos: np.ndarray, hand: str,
             # start the scan at whatever scale still leaves CONFORM_HOLD
             # of proximal flexion
             held = abs(base[i, prox])
-            opened = (min(1.0, CONFORM_HOLD / held) if held > 1e-6
+            opened = (min(1.0, hold / held) if held > 1e-6
                       else CONFORM_OPEN)
             grid = np.linspace(min(opened, 1.0), CONFORM_CEIL, 25)
+            if full_scan:
+                gs = np.array([probe(c) for c in grid])
+                touching = np.nonzero((gs >= CONFORM_MARGIN)
+                                      & (gs <= CONFORM_TOUCH))[0]
+                clear = np.nonzero(gs > CONFORM_TOUCH)[0]
+                if len(touching):
+                    scales[finger][i] = grid[touching[0]]
+                elif len(clear):
+                    scales[finger][i] = grid[clear[np.argmin(gs[clear])]]
+                else:
+                    scales[finger][i] = grid[int(np.argmax(gs))]
+                chosen[finger][i] = scales[finger][i]
+                continue
             touch, reach, reach_gap = None, None, np.inf
             for cand in grid:
                 g = probe(cand)
@@ -1062,7 +1080,7 @@ def _conform_fingers(model, qpos: np.ndarray, hand: str,
                 if gaps(gids) >= CONFORM_MARGIN:
                     continue
                 held = abs(base[i, prox])
-                low = (min(1.0, CONFORM_HOLD / held) if held > 1e-6
+                low = (min(1.0, hold / held) if held > 1e-6
                        else CONFORM_OPEN)
                 high = max(s[i], low)
                 for _ in range(10):
@@ -1075,6 +1093,16 @@ def _conform_fingers(model, qpos: np.ndarray, hand: str,
                         high = mid
                 s[i] = low
             s = smooth(s, CONFORM_SETTLE)   # the repair spikes; ease them
+            if full_scan:
+                # the smoothing may have curled a finger back into the
+                # wood where the scan had it clear: take the scan's own
+                # choice there, a small step over a buried finger
+                for i in range(len(s)):
+                    data.qpos[:] = qpos[lo + i]
+                    pose(adrs, base[i], s[i])
+                    mujoco.mj_kinematics(model, data)
+                    if gaps(gids) < CONFORM_MARGIN - CONFORM_TOUCH:
+                        s[i] = chosen[finger][i]
         for adr, jlo, jhi in adrs:
             qpos[lo:hi, adr] = np.clip(s * base[:, adr], jlo, jhi)
     return {f: round(float(g) * 1000.0, 1) for f, g in worst.items()}
@@ -1172,6 +1200,204 @@ def _clear_palms(model, qpos: np.ndarray, hands, windows,
     return delta, worst
 
 
+class PoleTask:
+    """pole as a ReconTask (recon.run)."""
+
+    name = "pole"
+
+    def detect(self, qpos, meta, params, options) -> Interaction:
+        info = detect_pole_hold(meta, qpos)
+        info = apply_hand_windows(info, meta, qpos,
+                                  left=str(params["left"]),
+                                  right=str(params["right"]))
+        obj = infer_object(Path(meta["file_path"]).stem, str(params["object"]))
+        # a hand joining late or releasing early shows its own window
+        hands = "+".join(
+            h + ("" if g == info.grab_frame and e == info.end_frame
+                 else f"@f{g}-f{e}")
+            for h, g, e in zip(info.hands, info.hand_grabs, info.ends))
+        detail = (f"{hands} hold f{info.grab_frame}-f{info.end_frame} {obj} "
+                  f"transport {info.transport:.2f} "
+                  f"flags [{','.join(info.quality_flags) or '-'}]")
+        return Interaction(info.ok, detail, "no pole hold", info=info,
+                           object=obj)
+
+    def build(self, qpos_robot, meta, inter: Interaction, params) -> Built:
+        """The scene and reference of one pole trial. mass=0 uses the
+        spec's default; grasp_close overrides the calibrated touch
+        closure; grasp is the wrist treatment ("auto" = ik_retargeted
+        where the hand model exists, falling back per hand; "reference"
+        keeps the clip's own wrist)."""
+        info: PoleInfo = inter.info
+        mass = float(params["mass"])
+        grasp_close = float(params["grasp_close"])
+        grasp = str(params["grasp"])
+        if grasp not in GRASPS:
+            raise SystemExit(f"unknown grasp {grasp!r} "
+                             f"(use {', '.join(GRASPS)})")
+        spec = load_spec(inter.object)
+        mass = mass if mass > 0 else spec.mass
+        diameter = 2 * spec.handle_radius
+        fps = meta["fps"]
+        T = len(qpos_robot)
+        s, e = info.grab_frame, info.end_frame
+        released = "released_early" in info.quality_flags
+
+        calib = {h: calibrate_grasp(h, diameter, POWER_CLOSE_FRACTION,
+                                    wrap_radius=spec.handle_radius)
+                 for h in info.hands}
+        grasp_mode = grasp if grasp != "auto" else "ik_retargeted"
+        if any(c is None for c in calib.values()):
+            grasp_mode = "reference"    # handless template: no wrist to re-aim
+
+        # 1. object state from the ORIGINAL motion: the clip's own wrist
+        # pockets place the pole, never the re-aimed ones
+        pocket_tracks = [
+            palm_grip_track(qpos_robot, h, spec.handle_radius, s,
+                            calib[h][1] if calib[h] else None)
+            for h in info.hands]
+
+        jp = meta["joint_positions"]
+        reach = pocket_tracks[0][s, :2] - jp[s, 0, :2]
+        approach_yaw = (float(np.arctan2(reach[1], reach[0]))
+                        if np.linalg.norm(reach) > 1e-6 else 0.0)
+
+        obj_qpos, anchors, rest_pos, obj_flags = build_pole_trajectory(
+            pocket_tracks, info, spec, fps, approach_yaw)
+
+        # 2. wrist retarget onto the estimated object's own axis
+        grasp_infos: List[Dict] = []
+        grasp_flags: List[str] = []
+        for hand, hand_grab, hand_end in zip(info.hands, info.hand_grabs,
+                                             info.ends):
+            if grasp_mode == "ik_retargeted":
+                qpos_robot, ginfo = retarget_pole_hand(
+                    qpos_robot, meta, info, hand, calib[hand][1], obj_qpos,
+                    anchors[hand], grab=hand_grab, end=hand_end)
+                if ginfo["mode"] == "reference":
+                    grasp_flags.append(f"ik_fallback_{hand}")
+            else:
+                ginfo = {"hand": hand, "mode": "reference"}
+                if calib[hand] is None:
+                    ginfo["fallback"] = "no_hand_model"
+            grasp_infos.append(ginfo)
+
+        scene_xml = generate_pole_scene_xml(spec, mass, obj_qpos[0, :3],
+                                            obj_qpos[0, 3:])
+        model = mujoco.MjModel.from_xml_string(scene_xml)
+        layout.check_scene(model)
+        qpos = assemble_qpos(model, qpos_robot, obj_qpos)
+
+        closures: Dict[str, Dict] = {}
+        for hand, hand_grab, hand_end in zip(info.hands, info.hand_grabs,
+                                             info.ends):
+            if calib[hand] is None:
+                closures[hand] = {"touch": 0.0, "hold": 0.0, "caps": None}
+                continue
+            wrap = grasp_close if grasp_close > 0 else calib[hand][0]
+            hold_c = wrap + WRAP_SQUEEZE
+            caps = calib[hand][2]
+            _close_hand(model, qpos, hand, hand_grab, hand_end, wrap, hold_c,
+                        caps, hand_end < T - 6)
+
+        # Wrists and curl are final, so the handle can now be settled into
+        # the hands. The passes alternate because they push opposite ways:
+        # sliding the handle off a palm drives it into the fingertips curled
+        # around the far side. Two rounds land it in the free space between.
+        windows = {h: (g, e2) for h, g, e2 in zip(info.hands, info.hand_grabs,
+                                                  info.ends)}
+        palm_clear, shift, worst_pen = None, np.zeros(3), 0.0
+        pre_gaps: Dict[str, Dict] = {}
+        for round_ in range(2):
+            delta, palm_pen = _clear_palms(model, qpos, info.hands, windows)
+            worst_pen = max(worst_pen, palm_pen)
+            if delta is not None:
+                obj_qpos = obj_qpos.copy()
+                obj_qpos[:, :3] += delta
+                qpos[:, -7:-4] = obj_qpos[:, :3]
+                scene_xml = generate_pole_scene_xml(spec, mass, obj_qpos[0, :3],
+                                                    obj_qpos[0, 3:])
+                model = mujoco.MjModel.from_xml_string(scene_xml)
+                shift = np.maximum(shift, np.abs(delta).max(axis=0))
+            for hand, hand_grab, hand_end in zip(info.hands, info.hand_grabs,
+                                                 info.ends):
+                if calib[hand] is None:
+                    continue
+                gaps = _conform_fingers(model, qpos, hand, hand_grab, hand_end)
+                if round_ == 0:          # the record is of the curl as calibrated
+                    pre_gaps[hand] = gaps
+        if worst_pen > 0:
+            palm_clear = {"max_pen_before_mm": round(float(worst_pen) * 1000, 1),
+                          "max_shift_mm": round(float(np.linalg.norm(shift))
+                                                * 1000, 1)}
+
+        for hand, hand_grab, hand_end in zip(info.hands, info.hand_grabs,
+                                             info.ends):
+            if calib[hand] is None:
+                continue
+            wrap = grasp_close if grasp_close > 0 else calib[hand][0]
+            hold_c = wrap + WRAP_SQUEEZE
+            caps = calib[hand][2]
+            closures[hand] = {
+                "touch": round(wrap, 4), "hold": round(hold_c, 4),
+                "caps": ({k: round(float(v), 3) for k, v in caps.items()}
+                         if caps else None),
+                # worst finger-vs-handle gap the calibrated curl reached
+                # before _conform_fingers backed it off (mm, negative =
+                # through the handle)
+                "pre_conform_gap_mm": pre_gaps.get(hand) or None}
+
+        p1 = pocket_tracks[0]
+        lift_height = float(p1[s:e + 1, 2].max() - p1[s, 2])
+
+        # ends held: pad with the frozen final pose so the receding horizon
+        # has a full reference window (see pick.py)
+        pad = 0 if released else int(HOLD_PAD_S * fps)
+
+        tspec = TrialSpec(
+            task_type="pole_carry",
+            object=ObjectSpec(
+                kind="mesh", size=[diameter, diameter, spec.height],
+                mass=mass, symmetry="axial",
+                info={"name": spec.name, "handle_radius": spec.handle_radius,
+                      "height": spec.height}),
+            window=(s, e),
+            starts_held=info.starts_held,
+            lift_height=lift_height,
+            # per-hand grip anchors for the solve: hold the SIMULATED pole
+            # so the point `anchor` up its axis sits in each palm's pocket
+            grips=[Grip(
+                hand=h, window=(g, e2),
+                pocket=calib[h][1] if calib[h] else None,
+                anchor=[0.0, 0.0, anchors[h]],
+                extra={"closure_touch": closures[h]["touch"],
+                       "closure_hold": closures[h]["hold"],
+                       "closure_caps": closures[h]["caps"],
+                       "pre_conform_gap_mm":
+                           closures[h].get("pre_conform_gap_mm")})
+                for h, g, e2 in zip(info.hands, info.hand_grabs, info.ends)],
+            grasp=grasp_infos,
+            flags=info.quality_flags + obj_flags + grasp_flags,
+            hand_noise_scale=HAND_NOISE_SCALE,
+            extra={"hands": list(info.hands),
+                   "palm_clearance": palm_clear,
+                   "transport": round(info.transport, 3)},
+        )
+        # contact reference and interaction graph: the driver's defaults
+        # (each holding palm at its own FK track over its window)
+        return Built(scene_xml, model, qpos, tspec, pad=pad)
+
+    def describe(self, task_info: Dict) -> str:
+        clear = task_info.get("palm_clearance") or {}
+        if not clear:
+            return ""
+        return (f" palm-clear (pen {clear['max_pen_before_mm']:.0f}mm "
+                f"cleared, shift {clear['max_shift_mm']:.0f}mm)")
+
+
+TASK = PoleTask()
+
+
 def emit_pole_trial(
     qpos_robot: np.ndarray,
     meta: Dict,
@@ -1184,242 +1410,14 @@ def emit_pole_trial(
     grasp_close: float = 0.0,
     grasp: str = "auto",
 ) -> Optional[Path]:
-    """Write a complete pole trial (same layout and file contract as
-    scene.emit_trial). Returns the trial dir, or None when frame 0 spawns
-    the robot deep inside the scene. mass=0 uses the spec's default;
-    grasp_close overrides the calibrated touch closure; grasp is the
-    wrist treatment ("auto" = ik_retargeted where the hand model exists,
-    falling back per hand; "reference" keeps the clip's own wrist)."""
-    if grasp not in GRASPS:
-        raise SystemExit(f"unknown grasp {grasp!r} "
-                         f"(use {', '.join(GRASPS)})")
-    spec = load_spec(object_name)
-    mass = mass if mass > 0 else spec.mass
-    diameter = 2 * spec.handle_radius
-    fps = meta["fps"]
-    T = len(qpos_robot)
-    s, e = info.grab_frame, info.end_frame
-    released = "released_early" in info.quality_flags
-
-    calib = {h: calibrate_grasp(h, diameter, POWER_CLOSE_FRACTION,
-                                wrap_radius=spec.handle_radius)
-             for h in info.hands}
-    grasp_mode = grasp if grasp != "auto" else "ik_retargeted"
-    if any(c is None for c in calib.values()):
-        grasp_mode = "reference"    # handless template: no wrist to re-aim
-
-    # 1. object state from the ORIGINAL motion: the clip's own wrist
-    # pockets place the pole, never the re-aimed ones
-    pocket_tracks = [
-        palm_grip_track(qpos_robot, h, spec.handle_radius, s,
-                        calib[h][1] if calib[h] else None)
-        for h in info.hands]
-
-    jp = meta["joint_positions"]
-    reach = pocket_tracks[0][s, :2] - jp[s, 0, :2]
-    approach_yaw = (float(np.arctan2(reach[1], reach[0]))
-                    if np.linalg.norm(reach) > 1e-6 else 0.0)
-
-    obj_qpos, anchors, rest_pos, obj_flags = build_pole_trajectory(
-        pocket_tracks, info, spec, fps, approach_yaw)
-
-    # 2. wrist retarget onto the estimated object's own axis
-    grasp_infos: List[Dict] = []
-    grasp_flags: List[str] = []
-    for hand, hand_grab, hand_end in zip(info.hands, info.hand_grabs,
-                                         info.ends):
-        if grasp_mode == "ik_retargeted":
-            qpos_robot, ginfo = retarget_pole_hand(
-                qpos_robot, meta, info, hand, calib[hand][1], obj_qpos,
-                anchors[hand], grab=hand_grab, end=hand_end)
-            if ginfo["mode"] == "reference":
-                grasp_flags.append(f"ik_fallback_{hand}")
-        else:
-            ginfo = {"hand": hand, "mode": "reference"}
-            if calib[hand] is None:
-                ginfo["fallback"] = "no_hand_model"
-        grasp_infos.append(ginfo)
-
-    scene_xml = generate_pole_scene_xml(spec, mass, obj_qpos[0, :3],
-                                        obj_qpos[0, 3:])
-    model = mujoco.MjModel.from_xml_string(scene_xml)
-    layout.check_scene(model)
-
-    qpos = np.zeros((T, model.nq))
-    qpos[:, :7] = qpos_robot[:, :7]
-    qpos[:, layout.body_addr(model)] = qpos_robot[:, 7:]
-    qpos[:, -7:] = obj_qpos
-
-    closures: Dict[str, Dict] = {}
-    for hand, hand_grab, hand_end in zip(info.hands, info.hand_grabs,
-                                         info.ends):
-        if calib[hand] is None:
-            closures[hand] = {"touch": 0.0, "hold": 0.0, "caps": None}
-            continue
-        wrap = grasp_close if grasp_close > 0 else calib[hand][0]
-        hold_c = wrap + WRAP_SQUEEZE
-        caps = calib[hand][2]
-        _close_hand(model, qpos, hand, hand_grab, hand_end, wrap, hold_c,
-                    caps, hand_end < T - 6)
-
-    # Wrists and curl are final, so the handle can now be settled into
-    # the hands. The passes alternate because they push opposite ways:
-    # sliding the handle off a palm drives it into the fingertips curled
-    # around the far side. Two rounds land it in the free space between.
-    windows = {h: (g, e2) for h, g, e2 in zip(info.hands, info.hand_grabs,
-                                              info.ends)}
-    palm_clear, shift, worst_pen = None, np.zeros(3), 0.0
-    pre_gaps: Dict[str, Dict] = {}
-    for round_ in range(2):
-        delta, palm_pen = _clear_palms(model, qpos, info.hands, windows)
-        worst_pen = max(worst_pen, palm_pen)
-        if delta is not None:
-            obj_qpos = obj_qpos.copy()
-            obj_qpos[:, :3] += delta
-            qpos[:, -7:-4] = obj_qpos[:, :3]
-            scene_xml = generate_pole_scene_xml(spec, mass, obj_qpos[0, :3],
-                                                obj_qpos[0, 3:])
-            model = mujoco.MjModel.from_xml_string(scene_xml)
-            shift = np.maximum(shift, np.abs(delta).max(axis=0))
-        for hand, hand_grab, hand_end in zip(info.hands, info.hand_grabs,
-                                             info.ends):
-            if calib[hand] is None:
-                continue
-            gaps = _conform_fingers(model, qpos, hand, hand_grab, hand_end)
-            if round_ == 0:          # the record is of the curl as calibrated
-                pre_gaps[hand] = gaps
-    if worst_pen > 0:
-        palm_clear = {"max_pen_before_mm": round(float(worst_pen) * 1000, 1),
-                      "max_shift_mm": round(float(np.linalg.norm(shift))
-                                            * 1000, 1)}
-
-    for hand, hand_grab, hand_end in zip(info.hands, info.hand_grabs,
-                                         info.ends):
-        if calib[hand] is None:
-            continue
-        wrap = grasp_close if grasp_close > 0 else calib[hand][0]
-        hold_c = wrap + WRAP_SQUEEZE
-        caps = calib[hand][2]
-        closures[hand] = {
-            "touch": round(wrap, 4), "hold": round(hold_c, 4),
-            "caps": ({k: round(float(v), 3) for k, v in caps.items()}
-                     if caps else None),
-            # worst finger-vs-handle gap the calibrated curl reached
-            # before _conform_fingers backed it off (mm, negative =
-            # through the handle)
-            "pre_conform_gap_mm": pre_gaps.get(hand) or None}
-
-    data = mujoco.MjData(model)
-    data.qpos[:] = qpos[0]
-    mujoco.mj_forward(model, data)
-    spawn_pen = measure_spawn_penetration(model, data)
-    if info.starts_held:
-        # holding at spawn = palm-vs-handle contact by design
-        hard_pen = {k: v for k, v in spawn_pen.items()
-                    if not (k.split("~")[0] in HAND_SPAWN_GEOMS
-                            and k.endswith("~largebox_geom"))}
-    else:
-        hard_pen = spawn_pen
-    if hard_pen and max(hard_pen.values()) > SPAWN_SKIP_PEN:
-        return None
-
-    task_dir = (Path(out_root) / "processed" / "kimodo" / "unitree_g1"
-                / "humanoid_object" / task)
-    trial_dir = task_dir / str(data_id)
-    trial_dir.mkdir(parents=True, exist_ok=True)
-    (task_dir / "scene.xml").write_text(scene_xml)
-
-    qvel = compute_qvel(model, qpos, 1.0 / fps)
-    ctrl = layout.ctrl_reference(model, qpos)
-
-    # contact reference for SPIDER's baked contact reward: each holding
-    # palm at its own reference FK track. Columns match site_ids.
-    site_ids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, n)
-                for n in ("left_palm", "right_palm")]
-    assert -1 not in site_ids, "palm sites missing from scene"
-    contact = np.zeros((T, 2))
-    contact_pos = np.zeros((T, 2, 3))
-    d2 = mujoco.MjData(model)
-    for t in range(T):
-        d2.qpos[:] = qpos[t]
-        mujoco.mj_kinematics(model, d2)
-        contact_pos[t, 0] = d2.site_xpos[site_ids[0]]
-        contact_pos[t, 1] = d2.site_xpos[site_ids[1]]
-    for hand, hand_grab, hand_end in zip(info.hands, info.hand_grabs,
-                                         info.ends):
-        contact[hand_grab:hand_end + 1, 0 if hand == "left" else 1] = 1.0
-
-    p1 = pocket_tracks[0]
-    lift_height = float(p1[s:e + 1, 2].max() - p1[s, 2])
-    graspish = GraspInfo(
-        pick_frame=s, release_frame=e, box_width=diameter,
-        raw_carry_gap=diameter, lift_height=lift_height,
-        quality_flags=list(info.quality_flags),
-        starts_held=info.starts_held)
-    graph = build_interaction_graph(meta, graspish)
-
-    # ends held: pad with the frozen final pose so the receding horizon
-    # has a full reference window (see pick.py)
-    pad = 0 if released else int(HOLD_PAD_S * fps)
-
-    def cut(a, pad_tail=None):
-        if not pad:
-            return a
-        tail = (np.repeat(a[-1:], pad, axis=0)
-                if pad_tail is None else pad_tail)
-        return np.concatenate([a, tail], axis=0)
-
-    np.savez(
-        trial_dir / "trajectory_kinematic.npz",
-        qpos=cut(qpos),
-        qvel=cut(qvel, np.zeros((pad, qvel.shape[1]))),
-        ctrl=cut(ctrl),
-        contact=cut(contact), contact_pos=cut(contact_pos),
-        link_contact=cut(graph.link_contact).astype(np.float32),
-        link_pos=cut(graph.link_pos).astype(np.float32),
-    )
-    task_info = {
-        "task_type": "pole_carry",
-        "ref_dt": 1.0 / fps,
-        "contact_site_ids": site_ids,
-        "source_npz": meta["file_path"],
-        "pick_frame": s,
-        "release_frame": e,
-        "starts_held": info.starts_held,
-        "hands": list(info.hands),
-        "object": {"name": spec.name, "handle_radius": spec.handle_radius,
-                   "height": spec.height, "mass": mass},
-        # per-hand grip anchors for the solve: hold the SIMULATED pole so
-        # the point `anchor` up its axis sits in each palm's pocket
-        "grips": [
-            {"hand": h,
-             "grab_frame": g,
-             "release_frame": e2,
-             "pocket": ([round(float(v), 4) for v in calib[h][1]]
-                        if calib[h] else None),
-             "anchor": [0.0, 0.0, round(anchors[h], 4)],
-             "closure_touch": closures[h]["touch"],
-             "closure_hold": closures[h]["hold"],
-             "closure_caps": closures[h]["caps"],
-             "pre_conform_gap_mm": closures[h].get("pre_conform_gap_mm")}
-            for h, g, e2 in zip(info.hands, info.hand_grabs, info.ends)],
-        "grasp": grasp_infos,
-        "hand_noise_scale": HAND_NOISE_SCALE,
-        "palm_clearance": palm_clear,
-        "transport": round(info.transport, 3),
-        "lift_height": round(lift_height, 4),
-        "quality_flags": info.quality_flags + obj_flags + grasp_flags,
-        "has_table": False,
-        "table_top_z": 0.0,
-        # bounding dims, so box-oriented viewers can still frame it
-        "box_size": [diameter, diameter, spec.height],
-        "box_mass": mass,
-        "spawn_penetration": spawn_pen,
-        "key_links": list(KEY_LINKS),
-        "scene_types": list(SCENE_TYPES),
-        "graph_flags": graph.flags,
-        "terrain_geoms": [],
-    }
-    (task_dir / "task_info.json").write_text(json.dumps(task_info,
-                                                        indent=2))
-    return trial_dir
+    """Write a complete pole trial from an already detected hold (the
+    recon.run pipeline from `build` on). Returns the trial dir, or None
+    when the motion admits no scene."""
+    from .run import emit  # late: run imports this module's siblings
+    params = {"object": object_name, "mass": mass, "grasp_close": grasp_close,
+              "grasp": grasp, "left": "auto", "right": "auto"}
+    trial, _info, _why = emit(TASK, qpos_robot, meta,
+                              Interaction(True, "", info=info,
+                                          object=object_name),
+                              out_root, task, params, data_id=data_id)
+    return trial

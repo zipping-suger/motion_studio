@@ -1,11 +1,11 @@
 """Downstream-task registry.
 
-Each task module exposes a module-level ``TASK`` (see `base.Task`).
-Loading is lazy so listing names never drags in a task's heavy imports;
-torch never loads here, since solve runtimes are reached only through
-each task's subprocess command.
+Each task module exposes a module-level ``TASK`` (see `base.Task`) and
+is MuJoCo-free: a task's reconstruction is imported only when it runs,
+so listing tasks and reading their parameters works in every venv
+(the demo add-on builds its dropdowns from these).
 
-    tasks.load("under_table").reconstruct(npz, out_root, name, options)
+    tasks.load("pole").reconstruct(npz, out_root, name, options)
 
 config.yml's ``tasks: {<name>: {scene: ..., solve: ...}}`` overrides a
 task's defaults per machine; `overrides()` exposes the loaded section so
@@ -14,17 +14,17 @@ the CLI and task modules merge from one place.
 
 import importlib
 
-from ..config import TASK_OVERRIDES
-from .base import Task
+from .base import Task, overrides
+
+__all__ = ["DEFAULT", "Task", "load", "names", "overrides"]
 
 DEFAULT = "box_carry"
 
 _REGISTRY = {
     "box_carry": ".box_carry",
-    "under_table": ".under_table",
-    "kick": ".kick",
     "ground_pick": ".ground_pick",
     "pole": ".pole",
+    "chair": ".chair",
 }
 
 
@@ -37,8 +37,3 @@ def load(name: str) -> Task:
         raise SystemExit(
             f"unknown task {name!r} (available: {', '.join(_REGISTRY)})")
     return importlib.import_module(_REGISTRY[name], __package__).TASK
-
-
-def overrides(name: str, section: str) -> dict:
-    """config.yml's tasks.<name>.<section> mapping ({} if absent)."""
-    return (TASK_OVERRIDES.get(name) or {}).get(section) or {}

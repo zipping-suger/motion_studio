@@ -6,6 +6,8 @@ from pathlib import Path
 
 import yaml
 
+from .solve.defaults import SOLVE_DEFAULTS, SOLVE_INT_KEYS  # noqa: F401
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNS_DIR = REPO_ROOT / "runs"
 RAW_MOTION_DIR = REPO_ROOT / "raw_motion"
@@ -28,10 +30,11 @@ DEFAULT_SPIDER = REPO_ROOT / "extern/spider"
 PROCESSED_ROOT = Path("processed/kimodo/unitree_g1")
 TASK_SUBTREE = PROCESSED_ROOT / "humanoid_object"
 
-# Scene-reconstruction parameters, as all three GUIs expose them. Here
-# rather than in studio.recon because the demo add-on runs in the kimodo
-# venv, which has no MuJoCo. Overridable from config.yml's `scene:`
-# section and per-run from the GUIs and `studio recon` flags.
+# box_carry's scene-reconstruction parameters, as every GUI exposes them
+# (the other tasks' live with the task, studio.tasks.<task>.SCENE_DEFAULTS;
+# all of them are MuJoCo-free so the demo add-on can read them).
+# Overridable from config.yml's `scene:` section and per-run from the
+# GUIs and `studio recon` flags.
 SCENE_DEFAULTS = {
     "box_mass": 0.2,        # kg
     "box_height": 0.20,     # m
@@ -43,97 +46,9 @@ SCENE_DEFAULTS = {
     "floor_snap_below": 0.25,
 }
 
-# ground_pick's SCENE_DEFAULTS, here for the same reason as above.
-# Overridable from config.yml's `tasks: {ground_pick: {scene: ...}}` and
-# per-run from the GUIs and `studio recon --set`.
-PICK_SCENE_DEFAULTS = {
-    "shape": "auto",      # cube | cylinder | ball | auto (from clip name)
-    "size": 0.06,         # m: cube edge / cylinder diameter / ball diameter
-    "cyl_height": 0.10,   # m: cylinder height. Keep it under the hand's
-                          # floor-reach height — a taller bottle's top
-                          # sits above the palm-down approach.
-    "mass": 0.10,         # kg
-    "grasp_close": 0.0,   # rad: wrap-closure override; 0 = calibrated
-                          # from the hand model to touch the object
-    "grasp": "auto",      # reference | ik_retargeted | auto. Cylinders
-                          # get ik_retargeted: the wrist is re-aimed so
-                          # the palm wraps the curved surface.
-}
-PICK_SHAPES = ("auto", "cube", "cylinder", "ball")
-PICK_GRASPS = ("auto", "reference", "ik_retargeted")
-
-# the pole task's SCENE_DEFAULTS, here for the same reason as above. The
-# window, hands, engagement and wrist retarget are all detected from the
-# clip, so these are the only knobs.
-POLE_SCENE_DEFAULTS = {
-    "object": "auto",     # a measured mesh (see POLE_OBJECTS) or auto
-                          # (from the clip name)
-    "mass": 0.0,          # kg; 0 = the object spec's default
-    "grasp_close": 0.0,   # rad: wrap-closure override; 0 = calibrated
-                          # from the hand model to touch the handle
-    "grasp": "auto",      # ik_retargeted | reference | auto. Re-aims the
-                          # wrist to wrap the pole's axis wherever the
-                          # hand model exists.
-    "left": "auto",       # this hand's contact window: auto, off, or
-                          # inclusive frames "S-E" / "S-"
-    "right": "auto",      # same for the right hand
-}
-# the roster is whatever sidecars exist under assets/object_mesh/
-POLE_OBJECTS = ("auto",) + tuple(sorted(
-    p.stem for p in (REPO_ROOT / "assets" / "object_mesh").glob("*.json")))
-
-# pole solve deltas over SOLVE_DEFAULTS. At grip 1.0 the 8.0 object
-# tracking term makes BATTING the pole cheaper than holding it: a solve
-# kept hands on only 53% of frames and dropped it during the end pad.
-# At 4.0 the same solve held every frame, object error 0.176 -> 0.054.
-POLE_SOLVE_OVERRIDES = {"grip_rew_scale": 4.0}
-
-# SBMPC solve hyperparameters, as the panel exposes them: object
-# interaction is the objective, robot tracking only guides. The fixed task
-# setup lives in studio.solve.spider_cfg. Overridable from config.yml's
-# `solve:` section.
-SOLVE_DEFAULTS = {
-    "num_samples": 2048,        # parallel mujoco_warp worlds (VRAM-bound)
-    "horizon": 1.0,             # s, planning horizon
-    "max_num_iterations": 16,   # annealing iterations per control tick
-    "temperature": 1.0,         # softmax temperature over the top 10%
-    "joint_rew_scale": 0.5,     # robot joints (guide only)
-    "base_pos_rew_scale": 1.0,
-    "base_rot_rew_scale": 1.0,
-    "pos_rew_scale": 8.0,       # object position (the objective)
-    "rot_rew_scale": 0.2,       # object orientation (barely matters for a box)
-    "contact_rew_scale": 2.0,   # pulls each holding palm onto the object
-                                # through its hold window, so intermittent
-                                # slap-and-release prices worse than a
-                                # maintained hold. box_carry uses the
-                                # simulated box's grasp faces, the others
-                                # the baked palm track.
-    "vel_rew_scale": 1.0,       # master scale of the per-block velocity term
-    "grip_rew_scale": 1.0,      # keep the SIMULATED object in the palm's
-                                # calibrated pocket: slip shows as
-                                # palm-relative drift long before a drop
-    "upright_rew_scale": 10.0,  # anti-fall: penalty for tilting PAST the
-                                # reference's own tilt or sinking BELOW
-                                # its height, so bending clips stay free.
-                                # Tracking alone prices a fall as another
-                                # pose error, and MPPI takes that trade.
-    "obj_end_rew_scale": 1.5,   # object-tracking multiplier at the
-                                # interaction's endpoints, which ARE the
-                                # objective...
-    "obj_mid_rew_scale": 0.5,   # ...and mid-interaction, where the
-                                # carried path matters less
-    "self_collision_rew_scale": 50.0,  # penalty per metre of summed
-                                # penetration across the template's ghost
-                                # self-pairs. They exert no force, so this
-                                # term is what steers rollouts apart.
-}
-
-# solve params that must stay integers when they reach the optimizer
-SOLVE_INT_KEYS = frozenset({"num_samples", "max_num_iterations"})
-
 # config.yml's `tasks:` section, e.g.
-# tasks: {under_table: {scene: {yaw_range: 0}, solve: {...}}}. The dicts
-# above are box_carry's equivalents, kept at top level for compatibility.
+# tasks: {pole: {scene: {object: tripod}, solve: {...}}}; the top-level
+# scene:/solve: sections above are box_carry's equivalents.
 TASK_OVERRIDES: dict = {}
 
 

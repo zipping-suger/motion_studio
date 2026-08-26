@@ -254,6 +254,17 @@ def load_kimodo_npz(
         "joint_positions": joint_positions_mj,
         "global_root_heading": d.get("global_root_heading"),
     }
+    # a clip that carries its object (raw_motion/behave): the pose of
+    # the object's canonical frame in the MuJoCo world, (T, 7) pos +
+    # wxyz quat, plus the sidecar it refers to
+    if "object_pos" in d and "object_quat_wxyz" in d:
+        metadata["object_pose"] = np.concatenate(
+            [d["object_pos"], d["object_quat_wxyz"]], axis=1
+        ).astype(np.float64)
+        metadata["object_name"] = (str(d["object_name"])
+                                   if "object_name" in d else None)
+    if "prefix_frames" in d:
+        metadata["prefix_frames"] = int(d["prefix_frames"])
     return qpos, metadata
 
 

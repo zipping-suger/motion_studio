@@ -12,7 +12,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from . import manifest, pipeline, recon, solve, tasks
+from . import manifest, pipeline, runner, tasks
+from .recon import assets
 from .config import (DEFAULT_KIMODO_VISER, REPO_ROOT, RUNS_DIR,
                      SCENE_DEFAULTS, SOLVE_DEFAULTS, SOLVE_INT_KEYS, Config,
                      load_config, task_dirs)
@@ -58,14 +59,14 @@ def _init_submodules(*repos: Path) -> None:
 
 def _setup_assets(cfg: Config, spider: Path, args) -> None:
     print("== G1 assets ==")
-    n = recon.assets.install(spider)
-    print(f"installed {n} file(s) into {recon.assets.G1_DIR}")
+    n = assets.install(spider)
+    print(f"installed {n} file(s) into {assets.G1_DIR}")
     root = (args.unitree_g1 or os.environ.get("UNITREE_G1_ROOT")
             or cfg.unitree_g1)
     if root:
-        n = recon.assets.install_brainco(Path(root).expanduser())
+        n = assets.install_brainco(Path(root).expanduser())
         print(f"installed {n} BrainCo-hand file(s) into "
-              f"{recon.assets.G1_DIR}")
+              f"{assets.G1_DIR}")
     else:
         print("skipping the BrainCo-hand variant: no unitree_g1 checkout "
               "configured (paths.unitree_g1 in config.yml, or --unitree-g1)")
@@ -278,8 +279,6 @@ def _recon_options(task_obj, args) -> dict:
                             task_obj.name, "scene")
 
     if task_obj.name == "box_carry":
-        if args.scene_seed is not None:
-            raise SystemExit("--scene-seed applies to obstacle tasks only")
         options = {"allow_held_start": args.allow_held_start}
         scene_params = {**box_flags, **set_params}
         if scene_params:
@@ -298,10 +297,7 @@ def _recon_options(task_obj, args) -> dict:
     if box_only:
         raise SystemExit(f"{', '.join(box_only)}: box_carry-only flag(s); "
                          f"use --set key=value for {task_obj.name} params")
-    scene_params = dict(set_params)
-    if args.scene_seed is not None:
-        scene_params["scene_seed"] = args.scene_seed
-    return {"scene_params": scene_params}
+    return {"scene_params": dict(set_params)}
 
 
 def cmd_recon(cfg: Config, args) -> int:
@@ -326,13 +322,13 @@ def cmd_watch(cfg: Config, args) -> int:
 
 
 def cmd_panel(cfg: Config, args) -> int:
-    solve.require(cfg)
+    runner.require(cfg)
     cmd = [str(cfg.solve_python), str(REPO_ROOT / "scripts/panel_app.py"),
            "--port", str(args.port)]
     if getattr(args, "name", None):
         cmd += ["--run", args.name]
     print("+ " + " ".join(cmd), flush=True)
-    os.execve(cmd[0], cmd, {**os.environ, **solve.env()})
+    os.execve(cmd[0], cmd, {**os.environ, **runner.env()})
 
 
 def cmd_solve(cfg: Config, args) -> int:
@@ -348,20 +344,9 @@ def cmd_solve(cfg: Config, args) -> int:
                   if getattr(args, k, None) is not None}
     set_params = _parse_set(args.set, task_obj.solve_defaults,
                             task_obj.name, "solve")
-    if task_obj.name == "box_carry":
-        params = {**box_params, **set_params}
-    elif set(task_obj.solve_defaults) == set(SOLVE_DEFAULTS):
-        # ground_pick and pole run the same SBMPC solver, so the box-style
-        # solve flags apply and config.yml's tasks.<name>.solve rides along
-        params = {**tasks.overrides(task_obj.name, "solve"),
-                  **box_params, **set_params}
-    else:
-        if box_params:
-            raise SystemExit(
-                f"{', '.join(sorted(box_params))}: box_carry-only solve "
-                f"flag(s); use --set key=value for {task_obj.name} params")
-        # passed explicitly: the solve subprocess never reads config.yml
-        params = {**tasks.overrides(task_obj.name, "solve"), **set_params}
+    # every task runs the same solver: the flags and --set are the
+    # explicit layer, the task resolves its defaults and config.yml
+    params = {**box_params, **set_params}
     return 0 if pipeline.solve_tasks(cfg, run_dir, trial_dirs, params) else 1
 
 
@@ -470,12 +455,9 @@ def main() -> None:
                    help="run name (default: derived from the source)")
     p.add_argument("--task", choices=tasks.names(), default=tasks.DEFAULT,
                    help="downstream task (default: %(default)s)")
-    p.add_argument("--scene-seed", type=int, default=None,
-                   help="obstacle-task scene randomization seed "
-                        "(jitter + yaw; default 0)")
     p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
-                   help="task scene param override, repeatable (see the "
-                        "task's defaults, e.g. tasks/under_table_params.py)")
+                   help="task scene param override, repeatable (keys: the "
+                        "task's SCENE_DEFAULTS in studio/tasks/<task>.py)")
     for key, val in SCENE_DEFAULTS.items():
         flag = "--" + key.replace("_", "-")
         if isinstance(val, str):
@@ -500,8 +482,7 @@ def main() -> None:
         p.add_argument("--" + key.replace("_", "-"),
                        type=int if key in SOLVE_INT_KEYS else float,
                        default=None,
-                       help=f"SBMPC solve param, box_carry/ground_pick "
-                            f"(default: {val})")
+                       help=f"SBMPC solve param (default: {val})")
     p.set_defaults(func=cmd_solve)
     p = sub.add_parser("panel", help="interactive viser panel: reconstruct + "
                                      "solve with tunable hyperparams")

@@ -8,10 +8,6 @@ across code versions even when the improvement early-exit settles on a
 different number of annealing iterations per tick.
 
 Usage:
-  # obstacle tasks (under_table / kick, studio.solve.mppi_loop):
-  python scripts/bench_solve.py --task-dir runs/<run>/outputs/processed/.../<trial>
-
-  # box_carry / ground_pick / pole (studio.solve.loop):
   python scripts/bench_solve.py --run runs/<run> --task <trial_name>
 """
 
@@ -29,15 +25,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from studio import solve                                    # noqa: E402
+from studio import runner                                   # noqa: E402
 from studio.config import REPO_ROOT, load_config            # noqa: E402
 
-CTRL_DT = 0.1  # both loops commit one 0.1 s control tick per rate line
+CTRL_DT = 0.1  # the loop commits one 0.1 s control tick per rate line
 TICK_RE = re.compile(r"Realtime rate: ([0-9.]+).*opt_steps: (\d+)")
 
 
 def run_bench(cmd: list[str], ticks: int, warmup: int) -> int:
-    env = {**os.environ, "PYTHONUNBUFFERED": "1", **solve.env()}
+    env = {**os.environ, "PYTHONUNBUFFERED": "1", **runner.env()}
     proc = subprocess.Popen([str(c) for c in cmd], cwd=str(REPO_ROOT),
                             env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
@@ -79,11 +75,9 @@ def run_bench(cmd: list[str], ticks: int, warmup: int) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--task-dir", type=Path,
-                    help="a built obstacle trial dir (mppi_loop)")
-    ap.add_argument("--run", type=Path,
-                    help="a run dir holding outputs/ (loop)")
-    ap.add_argument("--task", help="trial name inside --run")
+    ap.add_argument("--run", type=Path, required=True,
+                    help="a run dir holding outputs/")
+    ap.add_argument("--task", required=True, help="trial name inside --run")
     ap.add_argument("--ticks", type=int, default=10,
                     help="control ticks to measure (default 10)")
     ap.add_argument("--warmup", type=int, default=2,
@@ -91,25 +85,15 @@ def main() -> int:
     ap.add_argument("--param", action="append", default=[],
                     metavar="KEY=VALUE", help="forwarded to the solve loop")
     args = ap.parse_args()
-    if bool(args.task_dir) == bool(args.run):
-        ap.error("pass exactly one of --task-dir or (--run + --task)")
-    if args.run and not args.task:
-        ap.error("--run needs --task <trial_name>")
 
     cfg = load_config()
-    solve.require(cfg)
+    runner.require(cfg)
     scratch = Path(tempfile.mkdtemp(prefix="bench_solve_"))
     try:
-        if args.task_dir:
-            trial = scratch / args.task_dir.name
-            shutil.copytree(args.task_dir, trial)
-            cmd = [cfg.solve_python, "-m", "studio.solve.mppi_loop",
-                   "--task-dir", trial]
-        else:
-            outputs = scratch / "outputs"
-            shutil.copytree(args.run / "outputs", outputs)
-            cmd = [cfg.solve_python, "-m", "studio.solve.loop",
-                   "--task", args.task, "--dataset-dir", outputs]
+        outputs = scratch / "outputs"
+        shutil.copytree(args.run / "outputs", outputs)
+        cmd = [cfg.solve_python, "-m", "studio.solve.loop",
+               "--task", args.task, "--dataset-dir", outputs]
         for p in args.param:
             cmd += ["--param", p]
         return run_bench(cmd, args.ticks, args.warmup)
